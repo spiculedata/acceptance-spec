@@ -11,6 +11,200 @@ holds no secrets, and consumers pass anything sensitive through their own reposi
 
 Licensed under the Apache License 2.0 (see `LICENSE`).
 
+## Writing and running a spec
+
+This is the developer's view. Adopting the workflows in a repository is a separate job
+([`docs/adopting.md`](docs/adopting.md)); the spec file format is in [`docs/spec-format.md`](docs/spec-format.md).
+
+### Worked example
+
+**1. Start from the issue.** Issue #42 says: "`GET /api/version` answers 200 with a JSON body that has a string
+`version`." That one sentence is one criterion. Write one criterion per acceptance criterion in the issue; if the
+issue is vague, fix the issue, not the spec.
+
+**2. Write `acceptance/42/spec.json`.** One directory per issue; the directory name equals the `issue` field. A
+`command` spec runs an argv you provide, and its exit code is the verdict. It always runs, and it gets the app's
+address in `ACCEPTANCE_BASE_URL`:
+
+```json
+{
+  "issue": 42,
+  "title": "GET /api/version reports the app version",
+  "kind": "command",
+  "criteria": [
+    { "id": "C1", "given": "the app is running", "then": "GET /api/version answers 200 with a version string" }
+  ],
+  "command": ["node", "check.mjs"]
+}
+```
+
+`acceptance/42/check.mjs` (any language works; this one needs Node 18+ for `fetch`):
+
+```js
+const base = process.env.ACCEPTANCE_BASE_URL;
+if (!base) throw new Error('ACCEPTANCE_BASE_URL is not set');
+const res = await fetch(new URL('/api/version', base));
+if (res.status !== 200) throw new Error(`C1: expected 200, got ${res.status}`);
+const body = await res.json();
+if (typeof body.version !== 'string') throw new Error('C1: expected a version string');
+console.log(`C1 ok: version ${body.version}`);
+```
+
+For a plain HTTP check, an `api` spec needs no script at all. Another issue, #43 ("`GET /api/status` answers 200
+with `state` = `ok`"), as `acceptance/43/spec.json`. Relative paths sit under `base-path`, here `/api`:
+
+```json
+{
+  "issue": 43,
+  "title": "GET /api/status reports readiness",
+  "kind": "api",
+  "criteria": [
+    { "id": "C1", "given": "any caller", "then": "GET /api/status answers 200 with state ok" }
+  ],
+  "steps": [
+    {
+      "name": "status is ok",
+      "criterion": "C1",
+      "request": { "method": "GET", "path": "/status" },
+      "expect": { "status": 200, "json": { "state": { "equals": "ok" } } }
+    }
+  ]
+}
+```
+
+`api` specs run only when the workflow has a `base-url`; without one they are `not-run`, never a pass.
+
+**3. Commit the spec first.** On your feature branch, before any implementation:
+
+```bash
+git switch -c feat/version-endpoint
+git add acceptance/42
+git commit -m "test: acceptance spec for the version endpoint"
+```
+
+Start the app as it is (no `/api/version` yet) and run the spec: it must fail.
+
+```text
+$ node "$AS/acceptance-runner.mjs" run --dir acceptance/42 --base-url http://127.0.0.1:3000 --base-path /api
+acceptance/42: fail
+  x GET /api/version reports the app version - exit code: node check.mjs exited 1: ...
+Error: C1: expected 200, got 404
+```
+
+**4. Implement.** Add the endpoint in a later commit, restart the app and run the same command: `acceptance/42: pass`.
+
+**5. Open the PR** with a closing keyword in the body for the issue, for example `Closes #42` (a bare `#42` or
+"related to #42" is not a claim). CI then shows the spec failing on the base build and passing on yours.
+
+### Running and validating locally
+
+The scripts are plain Node 22+ with no dependencies. Check out this repository once, at the commit your workflow
+pins, and point `AS` at its `scripts/`:
+
+```bash
+git clone https://github.com/spiculedata/acceptance-spec ~/acceptance-spec
+git -C ~/acceptance-spec checkout <the 40-character SHA in your acceptance.yml>
+AS=~/acceptance-spec/scripts
+```
+
+Run these from the root of your repository, after your spec is written:
+
+```bash
+# 1. Validate the spec files and the convention, as the `convention` check does.
+#    --enforce-from 1 means "every issue owes a spec"; use your real cutoff to mirror CI.
+PR_BODY="Closes #42" node "$AS/acceptance-check.mjs" --enforce-from 1
+
+# 2. Run the specs against the app you started (build and start it yourself first).
+node "$AS/acceptance-runner.mjs" run --all --base-url http://127.0.0.1:3000 --base-path /api
+#    One spec only:  ... run --dir acceptance/42 --base-url ... --base-path ...
+```
+
+Command 1 prints `acceptance/42/spec.json present` and exits 0, or prints each problem (`"criteria" must be a
+non-empty array`, a shell metacharacter in `command`, a directory that does not match `issue`) and exits 1.
+Command 2 prints `pass` / `fail` / `not-run` per spec and exits 1 if any spec ran and failed.
+Add `--out results.json` to keep the JSON.
+
+To check red-on-base, green-on-head before you push, run the same specs against the base branch and compare, using
+the decision script CI uses:
+
+```bash
+git worktree add ../base main && cp -r acceptance ../base/       # base code + your new specs
+# start the BASE app, then:
+(cd ../base && node "$AS/acceptance-runner.mjs" run --all --base-url http://127.0.0.1:3000 \
+  --base-path /api --out /tmp/base.json)
+# stop it, start YOUR app, then:
+node "$AS/acceptance-runner.mjs" run --all --base-url http://127.0.0.1:3000 \
+  --base-path /api --out /tmp/head.json
+git diff --name-status main...HEAD -- 'acceptance/*/spec.json' > /tmp/changed.txt
+node "$AS/acceptance-base-check.mjs" --changed /tmp/changed.txt --head /tmp/head.json --base /tmp/base.json
+```
+
+Each spec reads `pass ... red on base, green on head` and the exit code is 0 when you are good; a spec that passes on base fails with `passes on the base branch`.
+
+### What the PR shows
+
+Three checks (job names are the caller's), plus an optional sticky comment if the repository added the `comment`
+job. The comment is one table, edited in place on every push:
+
+| Row | What it tells you |
+|---|---|
+| Convention (a closing PR ships its spec) | The PR closes issue N (N at or above the cutoff) and `acceptance/N/spec.json` exists and is valid. |
+| Specs on this PR's build | Every spec in `acceptance/` ran against your build. |
+| Spec-first proof (red on base, green on this PR) | Each spec you added or changed fails on the base build and passes on yours. |
+
+Each row has one result: **Pass**, **Proven** (red on base, green on head), **Fail**, **Passes on base: proves
+nothing**, **Not run**, or **Nothing to check**. The detail is in the job summary (its first line is
+`## Acceptance specs: <verdict>`) and in an annotation titled `acceptance <workflow>: <verdict>`. Under Fail, the
+job log says which spec and why, for example `not green on the PR build yet: implement the feature or fix the
+spec`. In report-only mode the comment says so: red does not turn the check red, so read the table, not the check marks.
+
+### The rules
+
+* **Red on base, green on head.** A spec you add or change must fail on the base branch's build and pass on the
+  PR's build. A spec written after the fact passes both and proves nothing, so a spec that already passes on base
+  fails the check (`passes-on-base`) unless a human labels the PR `spec-already-green`. A spec that is red on the
+  PR build fails with "not green on the PR build yet".
+* **`not-run` is never a pass.** It means the spec could not run here: an `api` spec with no base URL, missing
+  credentials, an unreadable spec, or a fork PR without the build token. Nothing is proven until it runs.
+* **Report vs enforce.** `mode: report` turns every failure into a warning, so repositories can roll the checks
+  out without blocking anyone. `mode: enforce` fails the job. Whether a failed job blocks the merge is the
+  repository's own branch protection.
+* **The cutoff.** `enforce-from-issue` is a number: issues below it owe no spec (the check says "grandfathered");
+  issues at or above it do. Set it to the latest issue **or PR** number plus one (they share one number space),
+  so every existing issue is exempt and only new ones owe a spec. An empty or non-numeric value enforces nothing.
+
+### The two labels
+
+Both are applied by a human, in the PR's labels, and nothing in CI applies them. **Agents and bots must never apply
+either one**; if you think one is warranted, say so in the PR and let a person decide.
+
+* `acceptance-waived`: this PR owes no spec because it is documentation-only or tests-only. It is per PR, and the
+  person applying it states the reason in a PR comment. It holds only if every changed file is documentation or a
+  test; a PR that touches anything else is treated as if the label were absent, and the check names the files.
+* `spec-already-green`: a spec added or changed here legitimately passes on base (a regression guard for
+  behaviour that already works). It excuses `passes-on-base` only; it never rescues a spec that fails on the PR build.
+
+Labels are read from the event payload when the workflow starts: apply one before pushing, or close and reopen the PR.
+The same goes for editing the PR body to add a closing keyword.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `this PR closes #N but adds no acceptance/N/spec.json` | Add the spec, or the PR is docs/tests-only and a human should label it. Check the directory is `acceptance/<issue number>/`, not the PR number. |
+| Convention says "not applicable (no-closing-issue)" | The body has no closing keyword. Use `Closes #N`, `Fixes #N` or `Resolves #N`, then push or close and reopen the PR. |
+| "grandfathered: issues before #X are not enforced" | The issue is below the cutoff. Nothing to do. |
+| `"criteria" must be a non-empty array` and similar | The spec is invalid; run the validate command above. Fix what it names. |
+| `"command" must not contain shell metacharacters` | `command` is argv, not a shell string: `["node", "check.mjs"]`. Put pipes and `&&` in a script. |
+| `acceptance/N/spec.json: "issue" is X but the directory is acceptance/N` | The `issue` field must equal the directory name. |
+| Spec is `not-run (no base URL configured)` | An `api` spec needs the workflow's `base-url`; locally, pass `--base-url`. For `auth: session\|basic` the `ACCEPTANCE_USER` / `ACCEPTANCE_PASSWORD` secrets (and for `session` the `session-path`) must be set. |
+| `passes on the base branch: it proves nothing` | The spec is not testing the change. Rewrite it so it fails without your fix and commit it before the fix. Only if it is a genuine regression guard, ask a human for `spec-already-green`. |
+| `not green on the PR build yet` | The feature is not working on your build, or the spec is wrong. Run the spec locally against your app. |
+| A command spec fails with `ACCEPTANCE_BASE_URL is not set` | Locally, pass `--base-url`. In CI the repository's workflow needs a `base-url`. |
+| `{{env.NAME}}` in a request is sent literally | Only the allow-listed environment (`ACCEPTANCE_*`, `PATH`, `HOME`, ...) resolves; anything else stays as written and the step goes red. |
+| Label or body change had no effect | Both are read at trigger time. Push a commit or close and reopen the PR. |
+| Red result but the check mark is green | The repository is in `mode: report`. Read the sticky comment or the job summary. |
+
 ## The workflows
 
 The first three do the work; the fourth, `comment.yml`, is optional. All are GitHub reusable workflows (`on: workflow_call`). Call them from a `pull_request` workflow,
@@ -45,7 +239,7 @@ jobs:
   convention:
     uses: spiculedata/acceptance-spec/.github/workflows/convention.yml@<full-40-char-sha>
     with:
-      enforce-from-issue: "123"   # the live latest issue number at adoption time
+      enforce-from-issue: "124"   # the live latest issue or PR number at adoption time, plus one
       mode: report                # report first, then enforce
 
   specs:
@@ -146,7 +340,7 @@ Common to `run-specs.yml` and `base-check.yml` unless marked.
 | `share-build`, `share-build-artifact-name` | `false`, `acceptance-results` | `base-check` only. Opt in: reuse that artifact instead of rebuilding head (falls back to building). Order the job after `run-specs` with `needs:`. |
 | `comment`, `*-verdict`, `report-only`, `heading` | `false`, empty | `comment.yml` only; see above. |
 | `base-cache-paths` | empty | `base-check` only. Newline-separated build outputs, relative to `working-directory`, cached on the base SHA. Empty: the base is always built. |
-| `enforce-from-issue` | required | `convention` only. Issues numbered below this owe no spec. Empty or not a number enforces nothing. |
+| `enforce-from-issue` | required | `convention` only. Issues numbered below this owe no spec; use the latest issue or PR number plus one. Empty or not a number enforces nothing. |
 | `waivable-paths` | empty | `convention` only. Newline-separated JavaScript regular expressions (repository-relative paths, forward slashes) that **replace** the built-in docs-and-tests list for the `acceptance-waived` label. Give the whole list, documentation patterns included. Use it to state your exact test layout instead of the generous `(^|/)e2e/` default. An expression that does not compile fails the job. |
 | `skip-outside-pull-request` | `false` | `convention` only. `true`: the job is skipped, not failed, on any event but `pull_request`. For a caller that also runs on `push` / `merge_group` with a required aggregate job: do not put an `if:` on the calling job, since a skipped calling job reports a bare check named after the caller job, which can shadow a required check of that name. |
 
@@ -231,7 +425,7 @@ find-and-replace), open a PR, and read the commit range
 
 ## Rollout modes
 
-1. **Report**: `mode: report` everywhere and `enforce-from-issue` set to the live latest issue number.
+1. **Report**: `mode: report` everywhere and `enforce-from-issue` set to the live latest issue or PR number plus one.
    Failures are warnings; nothing blocks.
 2. **Enforce convention**: switch `convention` to `enforce`. Only issues numbered at or above the cutoff owe a spec.
 3. **Enforce runs and spec-first**: switch `run-specs` and `base-check` to `enforce`.
