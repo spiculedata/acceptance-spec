@@ -65,37 +65,55 @@ const verdictOf = (results, issue) => {
 export function decideSpec({ issue, head, base, baseJobResult = 'success', excused = false }) {
   const spec = `acceptance/${issue}/spec.json`;
   if (!head) {
-    return { issue, verdict: 'fail', message: `${spec}: no result from the PR build, so "green on head" is unproven. Check the head-side run.` };
+    return { issue, verdict: 'fail', code: 'no-head-result', message: `${spec}: no result from the PR build, so "green on head" is unproven. Check the head-side run.` };
   }
   if (head.verdict === 'fail') {
-    return { issue, verdict: 'fail', message: `${spec}: fails on the PR build too. Fix the implementation (or the spec) until it is green on head.` };
+    const regression = base?.verdict === 'pass' ? ' It passes on the base branch, so this PR may have broken it.' : '';
+    return {
+      issue,
+      verdict: 'fail',
+      code: 'not-green-on-head',
+      message: `${spec}: not green on the PR build yet: implement the feature or fix the spec.${regression}`
+    };
   }
   if (head.verdict !== 'pass') {
-    return { issue, verdict: 'not-run', message: `${spec}: not run on the PR build${head.reason ? ` (${head.reason})` : ''}; red-on-base is unproven.` };
+    return { issue, verdict: 'not-run', code: 'not-run', message: `${spec}: not run on the PR build${head.reason ? ` (${head.reason})` : ''}; red-on-base is unproven.` };
   }
   if (baseJobResult === 'failure' || baseJobResult === 'cancelled') {
-    return { issue, verdict: 'fail', message: `${spec}: the base-side run did not complete (${baseJobResult}), so "red on base" is unproven. Re-run the failed jobs.` };
+    return { issue, verdict: 'fail', code: 'base-incomplete', message: `${spec}: the base-side run did not complete (${baseJobResult}), so "red on base" is unproven. Re-run the failed jobs.` };
   }
   if (!base) {
-    return { issue, verdict: 'fail', message: `${spec}: no result from the base build although the base run completed.` };
+    return { issue, verdict: 'fail', code: 'no-base-result', message: `${spec}: no result from the base build although the base run completed.` };
   }
   if (base.verdict === 'fail') {
-    return { issue, verdict: 'pass', message: `${spec}: red on base, green on head.` };
+    return { issue, verdict: 'pass', code: 'red-on-base-green-on-head', message: `${spec}: red on base, green on head.` };
   }
   if (base.verdict === 'pass') {
     if (excused) {
-      return { issue, verdict: 'excused', message: `${spec}: already passes on base; excused by the "${ESCAPE_LABEL}" label (applied by a human).` };
+      return { issue, verdict: 'excused', code: 'excused', message: `${spec}: passes on the base branch; excused by the "${ESCAPE_LABEL}" label (applied by a human).` };
     }
     return {
       issue,
       verdict: 'fail',
+      code: 'passes-on-base',
       message:
-        `${spec}: PASSES on the base branch's build, so it proves nothing about this change. ` +
-        `Write the spec so it fails without the fix (commit it first), or, if it is a legitimate regression guard for behaviour that already works, ` +
-        `have a maintainer add the "${ESCAPE_LABEL}" label and then push or close and reopen the PR.`
+        `${spec}: passes on the base branch: it proves nothing about this change (label ${ESCAPE_LABEL}, applied by a human, excuses it). ` +
+        `Otherwise write the spec so it fails without the fix and commit it first; then push or close and reopen the PR.`
     };
   }
-  return { issue, verdict: 'not-run', message: `${spec}: not run on the base build${base.reason ? ` (${base.reason})` : ''}; red-on-base is unproven.` };
+  return { issue, verdict: 'not-run', code: 'not-run', message: `${spec}: not run on the base build${base.reason ? ` (${base.reason})` : ''}; red-on-base is unproven.` };
+}
+
+/**
+ * The verdict a caller sees (workflow output, sticky comment): one of pass, red-on-base-green-on-head,
+ * fail, passes-on-base, not-run, skipped. `passes-on-base` is used only when that is the sole reason
+ * for failing; any other failure (or a mix) is `fail`.
+ */
+export function callerVerdictOf(verdict, specs) {
+  if (verdict === 'none') return 'skipped';
+  if (verdict === 'not-run') return 'not-run';
+  if (verdict === 'fail') return specs.filter((s) => s.verdict === 'fail').every((s) => s.code === 'passes-on-base') ? 'passes-on-base' : 'fail';
+  return specs.some((s) => s.code === 'red-on-base-green-on-head') ? 'red-on-base-green-on-head' : 'pass';
 }
 
 /** Fold the changed specs into one report. `verdict` is fail > not-run > pass; nothing changed => `none`. */
@@ -114,12 +132,12 @@ export function evaluate({ changedIssues, headResults, baseResults, baseJobResul
   if (specs.length === 0) verdict = 'none';
   else if (specs.some((s) => s.verdict === 'fail')) verdict = 'fail';
   else if (specs.some((s) => s.verdict === 'not-run')) verdict = 'not-run';
-  return { schemaVersion: 1, verdict, escapeLabel: excused, specs };
+  return { schemaVersion: 1, verdict, callerVerdict: callerVerdictOf(verdict, specs), escapeLabel: excused, specs };
 }
 
 /** Markdown for the job summary, one line per spec. */
 export function renderReport(report) {
-  const lines = [`## acceptance / spec fails on base: ${report.verdict}`, ''];
+  const lines = ['### Per-spec detail', ''];
   if (report.specs.length === 0) lines.push('No `acceptance/<issue>/spec.json` was added or changed by this PR; nothing to prove.');
   for (const s of report.specs) lines.push(`- **${s.verdict}** ${s.message}`);
   if (report.verdict === 'not-run') {

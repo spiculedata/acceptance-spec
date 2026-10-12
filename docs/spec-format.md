@@ -101,9 +101,15 @@ documentation (`docs/`, `*.md`, `.github/ISSUE_TEMPLATE/`) or a test (`src/test/
 held as if the label were absent, and the check names the disqualifying files.
 
 **Spec first.** Commit `acceptance/N/spec.json` before the implementation. `base-check.yml` runs every spec a
-PR adds or changes against the base commit's build and the PR's build. Per spec: red on base and green on head
-passes; passes on base fails (it proves nothing); fails on head fails; a base run that errored or recorded
-nothing fails; `not-run` on either side is reported `not-run`. The human-applied `spec-already-green` label
+PR adds or changes against the base commit's build and the PR's build. Per spec, the message says which case you are in:
+
+* red on base and green on head: **proven** (verdict `red-on-base-green-on-head`);
+* red on head: "not green on the PR build yet: implement the feature or fix the spec" (verdict `fail`; if it
+  passes on base, the message adds that this PR may have broken it);
+* green on base: "passes on the base branch: it proves nothing about this change" (verdict `passes-on-base`);
+* a base run that errored or recorded nothing fails; `not-run` on either side is reported `not-run`.
+
+The human-applied `spec-already-green` label
 excuses specs that legitimately pass on base (a regression guard for behaviour that already works). It never
 rescues a spec that fails on head. It is read from the event payload: apply it before pushing, or close and
 reopen the PR. Agents must not apply it.

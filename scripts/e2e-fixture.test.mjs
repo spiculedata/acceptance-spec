@@ -91,7 +91,7 @@ test('base-check flow: red on a base without the feature, green on head -> pass;
 
     const afterTheFact = verdict(headOut);
     assert.equal(afterTheFact.status, 1);
-    assert.match(afterTheFact.stdout, /PASSES on the base/);
+    assert.match(afterTheFact.stdout, /passes on the base branch: it proves nothing/);
   } finally {
     base.stop();
     head.stop();

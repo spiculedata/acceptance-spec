@@ -11,16 +11,17 @@ holds no secrets, and consumers pass anything sensitive through their own reposi
 
 Licensed under the Apache License 2.0 (see `LICENSE`).
 
-## The three workflows
+## The workflows
 
-All three are GitHub reusable workflows (`on: workflow_call`). Call them from a `pull_request` workflow,
+The first three do the work; the fourth, `comment.yml`, is optional. All are GitHub reusable workflows (`on: workflow_call`). Call them from a `pull_request` workflow,
 never `pull_request_target`, pinned to a **full commit SHA**:
 
 | Workflow | What it does |
 |---|---|
 | `convention.yml` | Fails a PR that closes issue N (N >= `enforce-from-issue`) without `acceptance/N/spec.json`. A human-applied `acceptance-waived` label waives a docs-only or tests-only PR, and the waiver is verified against the changed files. `mode: report` only warns. |
 | `run-specs.yml` | Builds the caller's app, starts it, and runs every `acceptance/<N>/spec.json` against it. `command` specs always run; `api` specs run only when a base URL is available, otherwise they are `not-run`, never `pass`. |
-| `base-check.yml` | Red on base, green on head: every spec a PR adds or changes must fail on the base commit's build and pass on the PR's build. A spec that already passes on base fails the check unless a human applied `spec-already-green`. Self-contained (builds and runs both sides) and caches the base build on the base SHA. |
+| `base-check.yml` | Red on base, green on head: every spec a PR adds or changes must fail on the base commit's build and pass on the PR's build. A spec that already passes on base fails the check unless a human applied `spec-already-green`. A spec that is not green on the PR build fails it with "not green on the PR build yet: implement the feature or fix the spec". Self-contained (builds and runs both sides) and caches the base build on the base SHA. |
+| `comment.yml` | Optional. Posts one sticky PR comment summarising the three verdicts in a small table (see "Seeing the result"). The only workflow here with a write scope, and only when a caller opts in. |
 
 ### Copy-paste caller for a generic repository
 
@@ -74,6 +75,52 @@ jobs:
       mode: report
 ```
 
+### Seeing the result
+
+In `mode: report` every job concludes green even when a spec is red, so the check marks alone hide it.
+Each of the three workflows therefore reports a verdict, three ways, without changing any job's result:
+
+* **Job summary.** One heading line, for example `## Acceptance specs: fail`, then the detail.
+* **Annotation.** `::notice` (pass, proven, skipped) or `::warning` (anything else) titled
+  `acceptance <workflow>: <verdict>`; it shows on the check run's page.
+* **Workflow outputs** `verdict` and `report-only` (`true` or `false`). `verdict` is one of:
+
+| `verdict` | Meaning |
+|---|---|
+| `pass` | Everything that ran passed (`convention`, `run-specs`), or every changed spec was excused by `spec-already-green`. |
+| `red-on-base-green-on-head` | `base-check` only: every changed spec fails on the base and passes on the PR. The proof. |
+| `fail` | Something is red or could not be proven (also: the job failed before it could report). |
+| `passes-on-base` | `base-check` only: the only problem is specs that already pass on the base branch. |
+| `not-run` | It could not run here (for example a fork PR without the build token). Never a pass. |
+| `skipped` | Nothing to check: no spec changed, no closing issue, or no specs. |
+
+`base-check` also has the output `build-reused` (see `share-build` in `docs/adopting.md`).
+
+Job names are not changed (callers key required checks on them); the verdict is not in the name.
+
+**Sticky comment (opt in).** Add a job that calls `comment.yml`. It reads only the verdict strings, checks
+out none of the caller's code, and is the only job that gets `pull-requests: write`. It finds its comment
+by a hidden marker (and by the Actions bot as author) and edits it in place on every push, so there is one
+comment per PR. Fork PRs are skipped (read-only token).
+
+```yaml
+  comment:
+    needs: [convention, specs, spec-first]
+    if: always()
+    permissions:
+      contents: read
+      pull-requests: write       # this job only
+    uses: spiculedata/acceptance-spec/.github/workflows/comment.yml@<full-40-char-sha>
+    with:
+      comment: true
+      convention-verdict: ${{ needs.convention.outputs.verdict }}
+      run-specs-verdict: ${{ needs.specs.outputs.verdict }}
+      base-check-verdict: ${{ needs.spec-first.outputs.verdict }}
+      report-only: ${{ needs.specs.outputs.report-only }}
+```
+
+Leave a verdict input out (or empty) to leave that row out. Callers that do not add this job are unaffected.
+
 ### Inputs
 
 Common to `run-specs.yml` and `base-check.yml` unless marked.
@@ -95,6 +142,9 @@ Common to `run-specs.yml` and `base-check.yml` unless marked.
 | `runs-on` | `ubuntu-latest` | Runner label. |
 | `timeout-minutes` | `25` | Job timeout (the two run workflows). |
 | `artifact-name` | `acceptance-results` / `acceptance-base-check` | Prefix of the uploaded result artifacts. |
+| `share-build`, `share-build-paths` | `false`, empty | `run-specs` only. Opt in: upload the head build output (`share-build-paths`, newline separated, relative to `working-directory`) as a workflow artifact for `base-check`. See `docs/adopting.md`. |
+| `share-build`, `share-build-artifact-name` | `false`, `acceptance-results` | `base-check` only. Opt in: reuse that artifact instead of rebuilding head (falls back to building). Order the job after `run-specs` with `needs:`. |
+| `comment`, `*-verdict`, `report-only`, `heading` | `false`, empty | `comment.yml` only; see above. |
 | `base-cache-paths` | empty | `base-check` only. Newline-separated build outputs, relative to `working-directory`, cached on the base SHA. Empty: the base is always built. |
 | `enforce-from-issue` | required | `convention` only. Issues numbered below this owe no spec. Empty or not a number enforces nothing. |
 
@@ -134,7 +184,7 @@ Kept from saiku:
 
 - `pull_request` only. The workflows refuse to run on any other event, and a guard test fails if a
   workflow here gains `pull_request_target` or `workflow_run`.
-- `permissions: contents: read`, no write scope, no `GITHUB_TOKEN` handed to specs. The first
+- `permissions: contents: read`, no write scope anywhere except the opt-in `comment.yml` job (`pull-requests: write`, no checkout of the caller's code, no PR text, skipped on forks; a guard test enforces this), no `GITHUB_TOKEN` handed to specs. The first
   `actions/checkout` persists no credentials.
 - Third-party actions are pinned to full commit SHAs (the same pins saiku uses); a test fails otherwise.
 - Spec commands run with an allow-listed environment (`PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_*`, `CI`,

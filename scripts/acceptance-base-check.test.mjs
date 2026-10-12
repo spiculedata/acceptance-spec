@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { ESCAPE_LABEL, changedSpecIssues, decideSpec, evaluate, isExcused, main, renderReport } from './acceptance-base-check.mjs';
+import { ESCAPE_LABEL, callerVerdictOf, changedSpecIssues, decideSpec, evaluate, isExcused, main, renderReport } from './acceptance-base-check.mjs';
 import { runSpecs } from './acceptance-runner.mjs';
 
 const repoRoot = join(import.meta.dirname, '..');
@@ -73,7 +73,7 @@ test('a spec that passes on base fails, names the spec and says how to proceed',
   const d = decideSpec({ issue: 5, head: pass, base: pass });
   assert.equal(d.verdict, 'fail');
   assert.match(d.message, /acceptance\/5\/spec\.json/);
-  assert.match(d.message, /PASSES on the base/);
+  assert.match(d.message, /passes on the base branch: it proves nothing/);
   assert.match(d.message, /spec-already-green/);
 });
 
@@ -132,8 +132,8 @@ test('evaluate: any failing spec fails the PR; the others are still reported', (
   assert.equal(report.verdict, 'fail');
   assert.deepEqual(report.specs.map((s) => s.verdict), ['pass', 'fail', 'pass']);
   const text = renderReport(report);
-  assert.match(text, /acceptance \/ spec fails on base: fail/);
-  assert.match(text, /acceptance\/2\/spec\.json: PASSES on the base/);
+  assert.match(text, /Per-spec detail/);
+  assert.match(text, /acceptance\/2\/spec\.json: passes on the base branch: it proves nothing/);
 });
 
 test('evaluate: fail beats not-run, not-run beats pass, no specs is none', () => {
@@ -184,7 +184,7 @@ test('main exits 1 and annotates the failing spec when a spec passes on base', (
   const cap = capture();
   const code = main(['--changed', join(dir, 'changed.txt'), '--head', join(dir, 'head.json'), '--base', join(dir, 'base.json'), '--out', join(dir, 'verdict.json')], cap.io);
   assert.equal(code, 1);
-  assert.match(cap.out(), /::error::acceptance\/77\/spec\.json: PASSES on the base/);
+  assert.match(cap.out(), /::error::acceptance\/77\/spec\.json: passes on the base branch: it proves nothing/);
   assert.equal(JSON.parse(readFileSync(join(dir, 'verdict.json'), 'utf8')).verdict, 'fail');
 });
 
@@ -283,7 +283,7 @@ test('end to end with the runner: a spec written after the fact (green on both b
     const headResults = await runSpecs({ repoRoot: root, baseUrl: head.url, issues: [4242], env: {} });
     const report = evaluate({ changedIssues: [4242], headResults, baseResults, baseJobResult: 'success', labels: '' });
     assert.equal(report.verdict, 'fail');
-    assert.match(report.specs[0].message, /acceptance\/4242\/spec\.json: PASSES on the base/);
+    assert.match(report.specs[0].message, /acceptance\/4242\/spec\.json: passes on the base branch: it proves nothing/);
   } finally {
     base.server.close();
     head.server.close();
@@ -307,7 +307,54 @@ test('--mode report downgrades a failing proof to a warning and exits 0', () => 
   const args = [cli, '--changed', join(dir, 'changed.txt'), '--head', join(dir, 'head.json'), '--base', join(dir, 'base.json')];
   const report = spawnSync(process.execPath, [...args, '--mode', 'report'], { encoding: 'utf8' });
   assert.equal(report.status, 0, report.stdout);
-  assert.match(report.stdout, /::warning::report-only: acceptance\/77\/spec\.json: PASSES on the base/);
+  assert.match(report.stdout, /::warning::report-only: acceptance\/77\/spec\.json: passes on the base branch: it proves nothing/);
   assert.equal(spawnSync(process.execPath, args, { encoding: 'utf8' }).status, 1);
   assert.equal(spawnSync(process.execPath, [...args, '--mode', 'x'], { encoding: 'utf8' }).status, 2);
+});
+
+// ------------------------------------------------------------------ wording and caller verdicts
+
+test('red on head, whatever the base: "not green on the PR build yet", never "fails on the PR build too"', () => {
+  for (const base of [fail, notRun('x'), null]) {
+    const d = decideSpec({ issue: 5, head: fail, base });
+    assert.equal(d.code, 'not-green-on-head');
+    assert.match(d.message, /not green on the PR build yet: implement the feature or fix the spec\./);
+    assert.doesNotMatch(d.message, /too/);
+    assert.doesNotMatch(d.message, /passes on the base/);
+  }
+});
+
+test('red on head but green on base is flagged as a possible regression', () => {
+  const d = decideSpec({ issue: 5, head: fail, base: pass });
+  assert.match(d.message, /not green on the PR build yet/);
+  assert.match(d.message, /passes on the base branch, so this PR may have broken it/);
+});
+
+test('passes on base names the label, says a human applies it, and carries its own code', () => {
+  const d = decideSpec({ issue: 5, head: pass, base: pass });
+  assert.equal(d.code, 'passes-on-base');
+  assert.match(d.message, /passes on the base branch: it proves nothing about this change \(label spec-already-green, applied by a human, excuses it\)/);
+});
+
+test('red on base and green on head carries the success code', () => {
+  assert.equal(decideSpec({ issue: 5, head: pass, base: fail }).code, 'red-on-base-green-on-head');
+});
+
+const callerVerdict = (changedIssues, head, base, labels = '') =>
+  evaluate({ changedIssues, headResults: results(head), baseResults: results(base), baseJobResult: 'success', labels }).callerVerdict;
+
+test('callerVerdict: one of pass, red-on-base-green-on-head, fail, passes-on-base, not-run, skipped', () => {
+  assert.equal(callerVerdict([], [], []), 'skipped');
+  assert.equal(callerVerdict([1], [[1, 'pass']], [[1, 'fail']]), 'red-on-base-green-on-head');
+  assert.equal(callerVerdict([1], [[1, 'fail']], [[1, 'fail']]), 'fail');
+  assert.equal(callerVerdict([1], [[1, 'pass']], [[1, 'pass']]), 'passes-on-base');
+  assert.equal(callerVerdict([1], [[1, 'pass']], [[1, 'pass']], 'spec-already-green'), 'pass');
+  assert.equal(callerVerdict([1, 2], [[1, 'pass'], [2, 'pass']], [[1, 'pass'], [2, 'fail']], 'spec-already-green'), 'red-on-base-green-on-head');
+  assert.equal(callerVerdict([1], [[1, 'not-run']], [[1, 'fail']]), 'not-run');
+});
+
+test('callerVerdict: passes-on-base only when it is the sole failure; a mix is fail', () => {
+  assert.equal(callerVerdict([1, 2], [[1, 'pass'], [2, 'fail']], [[1, 'pass'], [2, 'fail']]), 'fail');
+  assert.equal(callerVerdict([1, 2], [[1, 'pass'], [2, 'pass']], [[1, 'pass'], [2, 'pass']]), 'passes-on-base');
+  assert.equal(callerVerdictOf('none', []), 'skipped');
 });

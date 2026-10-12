@@ -80,6 +80,24 @@ on:
       artifact-name:
         type: string
         default: acceptance-base-check
+      share-build:
+        description: "Opt in: reuse the head build that run-specs.yml (called with share-build: true in the SAME run, and ordered before this with needs:) uploaded, instead of rebuilding head. Falls back to building when the artifact is missing. Skipped on fork PRs. See docs/adopting.md."
+        type: boolean
+        default: false
+      share-build-artifact-name:
+        description: "The artifact-name that run-specs.yml was called with (its default is acceptance-results)."
+        type: string
+        default: acceptance-results
+    outputs:
+      verdict:
+        description: "pass, red-on-base-green-on-head, fail, passes-on-base, not-run or skipped. In mode report a failure still leaves the jobs green: read this."
+        value: ${{ jobs.verdict.outputs.verdict || (jobs.detect.outputs.has_specs == 'false' && 'skipped' || 'fail') }}
+      report-only:
+        description: "true when mode is report."
+        value: ${{ jobs.detect.outputs.report_only || 'false' }}
+      build-reused:
+        description: "true when the head build was taken from run-specs instead of being rebuilt."
+        value: ${{ jobs.head-run.outputs.build_reused || 'false' }}
     secrets:
       ACCEPTANCE_USER:
         required: false
@@ -106,6 +124,7 @@ jobs:
       has_specs: ${{ steps.diff.outputs.has_specs }}
       issues: ${{ steps.diff.outputs.issues }}
       base_sha: ${{ steps.diff.outputs.base_sha }}
+      report_only: ${{ steps.diff.outputs.report_only }}
     steps:
       - name: Only for pull_request
         env:
@@ -158,6 +177,8 @@ jobs:
       - name: Changed acceptance specs
         id: diff
         working-directory: ${{ inputs.working-directory }}
+        env:
+          MODE: ${{ inputs.mode }}
         run: |
           # --relative: paths are relative to the working directory, and only it is considered.
           git diff --relative --name-status HEAD^1 HEAD -- 'acceptance/*/spec.json' > "$RUNNER_TEMP/changed-specs.txt"
@@ -166,6 +187,7 @@ jobs:
           {
             echo "issues=$ISSUES"
             echo "base_sha=$(git rev-parse HEAD^1)"
+            if [ "$MODE" = "report" ]; then echo "report_only=true"; else echo "report_only=false"; fi
             if [ -n "$ISSUES" ]; then echo "has_specs=true"; else echo "has_specs=false"; fi
           } >> "$GITHUB_OUTPUT"
 
@@ -178,6 +200,8 @@ jobs:
     timeout-minutes: ${{ inputs.timeout-minutes }}
     env:
       CHANGED_ISSUES: ${{ needs.detect.outputs.issues }}
+    outputs:
+      build_reused: ${{ steps.unpack.outputs.reused }}
     steps:
       - name: Only for pull_request
         env:
@@ -250,8 +274,29 @@ jobs:
           fi
           { echo "skip=$skip"; echo "base_url=$base_url"; } >> "$GITHUB_OUTPUT"
 
+      # Opt-in reuse (share-build): take the head build run-specs uploaded in this same run. A missing
+      # artifact or a bad archive falls back to the normal build below. Never on forks.
+      - name: Fetch the head build shared by run-specs
+        id: share
+        if: inputs.share-build && inputs.build-command != '' && steps.decide.outputs.skip != 'true' && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.share-build-artifact-name }}-build-${{ github.run_id }}
+          path: ${{ runner.temp }}/shared-build
+
+      - name: Unpack the shared head build
+        id: unpack
+        if: steps.share.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          bash "$RUNNER_TEMP/acceptance-scripts/share-build.sh" unpack "$RUNNER_TEMP/shared-build/acceptance-build-share.tar"
+          echo "reused=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Head build reused from run-specs (not rebuilt)."
+
       - name: Build
-        if: inputs.build-command != '' && steps.decide.outputs.skip != 'true'
+        if: inputs.build-command != '' && steps.decide.outputs.skip != 'true' && steps.unpack.outputs.reused != 'true'
         working-directory: ${{ inputs.working-directory }}
         env:
           BUILD_COMMAND: ${{ inputs.build-command }}
@@ -529,6 +574,8 @@ jobs:
     if: always() && needs.detect.outputs.has_specs == 'true'
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 5
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
     steps:
       - name: Only for pull_request
         env:
@@ -591,6 +638,7 @@ jobs:
           name: ${{ inputs.artifact-name }}-base-${{ github.run_id }}
           path: base-results
       - name: Each changed spec is red on base and green on head
+        id: verdict
         working-directory: ${{ inputs.working-directory }}
         env:
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
@@ -608,5 +656,9 @@ jobs:
             --mode "$MODE" \
             --out "$RUNNER_TEMP/spec-first-verdict.json" > "$RUNNER_TEMP/spec-first.md" || rc=$?
           cat "$RUNNER_TEMP/spec-first.md"
+          # One clear verdict line first (job summary, annotation title, outputs), then the per-spec detail.
+          # It describes the result and never changes the exit code below.
+          node "$RUNNER_TEMP/acceptance-scripts/acceptance-verdict.mjs" --kind base-check \
+            --input "$RUNNER_TEMP/spec-first-verdict.json" --mode "$MODE"
           grep -v '^::' "$RUNNER_TEMP/spec-first.md" >> "$GITHUB_STEP_SUMMARY" || true
           exit "$rc"

@@ -29,7 +29,10 @@ A checklist per repository. Do it in one PR, in report-only mode first.
 9. **Enforce.** Switch `convention` to `enforce`, then `run-specs` and `base-check`. Making any of them a
    required check is the repository's own decision (branch protection or rulesets); verify it in the
    repository's settings rather than assuming it.
-10. **Bump later** by replacing the SHA in every `uses:` line (see the README).
+10. **Make report mode readable (optional).** In `mode: report` red does not turn a check red. Add the
+    `comment` job from the README ("Seeing the result") to get one sticky PR comment with the three verdicts.
+    Give `pull-requests: write` to that job only, never to the jobs that build or run specs.
+11. **Bump later** by replacing the SHA in every `uses:` line (see the README).
 
 ## After the first adoption: confirm the cross-repository `uses:`
 
@@ -37,3 +40,43 @@ The first caller in another repository should confirm, in its `convention` job l
 `acceptance-spec scripts: spiculedata/acceptance-spec @ <the pinned sha>`, and that the "Fetch the
 acceptance-spec scripts" step succeeded with the repository's default token. If `job.workflow_sha` is empty
 the job stops with an explicit error rather than running unpinned scripts.
+
+## Optional: reuse the head build (`share-build`)
+
+`run-specs` and `base-check` each build the PR head, so the head is built twice. With `share-build`,
+`run-specs` uploads the head build output once and `base-check` unpacks it instead of rebuilding head
+(the base commit is still built by `base-check`). Default off; callers that do not set it are unchanged.
+
+```yaml
+  specs:
+    uses: spiculedata/acceptance-spec/.github/workflows/run-specs.yml@<full-40-char-sha>
+    with:
+      # ...as before...
+      share-build: true
+      share-build-paths: |
+        dist
+  spec-first:
+    needs: [specs]            # required: the artifact must exist before base-check starts
+    uses: spiculedata/acceptance-spec/.github/workflows/base-check.yml@<full-40-char-sha>
+    with:
+      # ...as before...
+      share-build: true
+```
+
+Trade-offs, read before turning it on:
+
+* **Ordering.** `base-check` has to wait for `run-specs` (`needs:`), so the two no longer run in parallel. You
+  save one head build of runner time; wall-clock time can stay the same or grow, because the base build now
+  starts after `run-specs` finishes. Measure it on a few PRs.
+* **Size and retention.** The build output is uploaded as one tar artifact named
+  `<artifact-name>-build-<run id>` with a one day retention. It counts against the repository's artifact
+  storage while it lives, and anyone who can read the repository's Actions artifacts can download it. Share
+  only `share-build-paths` that are safe to expose (no baked-in tokens, no environment dumps). Large outputs
+  (hundreds of MB) cost upload and download time and may not pay for themselves.
+* **Same run only.** Nothing is cached across runs; a re-run job gets the artifact of its own run.
+* **Safe fallback.** If the artifact is missing, cannot be downloaded or fails to unpack, `base-check` logs it and
+  builds head as usual (a failed download shows as an annotation on the run, the job stays green). The
+  `build-reused` output of `base-check` says which happened.
+* **Forks.** Never shared on fork PRs (read-only token); each workflow builds for itself.
+* **Same inputs.** Use the same `working-directory`, `build-command` and `java-version` on both, and set
+  `share-build-artifact-name` on `base-check` if you changed `artifact-name` on `run-specs`.

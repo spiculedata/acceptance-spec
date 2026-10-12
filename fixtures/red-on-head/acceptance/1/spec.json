@@ -1,0 +1,16 @@
+{
+  "issue": 1,
+  "title": "a command spec that is red on head (and on base)",
+  "kind": "command",
+  "criteria": [
+    {
+      "id": "C1",
+      "given": "any build",
+      "then": "the command exits 1"
+    }
+  ],
+  "command": [
+    "node",
+    "check.mjs"
+  ]
+}

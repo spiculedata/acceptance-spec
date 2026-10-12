@@ -1,0 +1,33 @@
+{
+  "issue": 3,
+  "title": "the gadgets endpoint lists a cog",
+  "kind": "api",
+  "criteria": [
+    {
+      "id": "C1",
+      "given": "any caller",
+      "then": "GET /api/gadgets answers 200 with a list that names a cog"
+    }
+  ],
+  "steps": [
+    {
+      "name": "gadgets are listed",
+      "criterion": "C1",
+      "request": {
+        "method": "GET",
+        "path": "/gadgets"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "$": {
+            "type": "array"
+          },
+          "[0].name": {
+            "equals": "cog"
+          }
+        }
+      }
+    }
+  ]
+}
