@@ -83,6 +83,21 @@ on:
         description: "Name of the uploaded results artifact."
         type: string
         default: acceptance-results
+      share-build:
+        description: "Opt in: upload the head build output (share-build-paths) as a workflow artifact so base-check, called in the same run with share-build: true, does not rebuild head. Skipped on fork PRs. See docs/adopting.md."
+        type: boolean
+        default: false
+      share-build-paths:
+        description: "Newline-separated build outputs, relative to working-directory (for example dist), to share. Required when share-build is true."
+        type: string
+        default: ""
+    outputs:
+      verdict:
+        description: "pass, fail, not-run or skipped. In mode report a fail still leaves the job green: read this."
+        value: ${{ jobs.specs.outputs.verdict || 'fail' }}
+      report-only:
+        description: "true when mode is report."
+        value: ${{ jobs.specs.outputs.report-only || 'false' }}
     secrets:
       ACCEPTANCE_USER:
         description: "Account for auth session / basic specs. Use a low-privilege account on a disposable instance."
@@ -105,6 +120,9 @@ jobs:
     name: acceptance specs
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      report-only: ${{ steps.verdict.outputs.report-only }}
     steps:
       - name: Only for pull_request
         env:
@@ -191,6 +209,26 @@ jobs:
           BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
         run: bash -eo pipefail -c "$BUILD_COMMAND"
 
+      # Opt-in reuse (share-build): hand the head build to base-check in the same run. Never on forks,
+      # whose token is read-only and whose build did not run anyway.
+      - name: Pack the head build for base-check
+        id: share
+        if: inputs.share-build && inputs.build-command != '' && steps.decide.outputs.skip != 'true' && github.event.pull_request.head.repo.full_name == github.repository
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          SHARE_PATHS: ${{ inputs.share-build-paths }}
+        run: bash "$RUNNER_TEMP/acceptance-scripts/share-build.sh" pack "$RUNNER_TEMP/acceptance-build-share.tar"
+
+      - name: Upload the head build for base-check
+        if: steps.share.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}-build-${{ github.run_id }}
+          path: ${{ runner.temp }}/acceptance-build-share.tar
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
       - name: Start the app
         if: inputs.start-command != '' && steps.decide.outputs.skip != 'true'
         env:
@@ -227,11 +265,20 @@ jobs:
         if: always()
         run: bash "$RUNNER_TEMP/acceptance-scripts/stop-server.sh"
 
+      # One clear verdict line (job summary, annotation title, workflow output). In mode report the job
+      # stays green on a red spec, so this is where the result is visible. It never changes the job result.
+      - name: Verdict
+        id: verdict
+        if: always()
+        env:
+          MODE: ${{ inputs.mode }}
+        run: node "$RUNNER_TEMP/acceptance-scripts/acceptance-verdict.mjs" --kind run-specs --input "$RUNNER_TEMP/acceptance-results.json" --mode "$MODE"
+
       - name: Summarise
         if: always()
         run: |
           {
-            echo '## Acceptance specs'
+            echo '### Results'
             echo
             echo '```json'
             cat "$RUNNER_TEMP/acceptance-results.json" 2>/dev/null || echo '{}'

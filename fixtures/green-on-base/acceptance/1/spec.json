@@ -1,0 +1,16 @@
+{
+  "issue": 1,
+  "title": "a command spec that is green on base (proves nothing)",
+  "kind": "command",
+  "criteria": [
+    {
+      "id": "C1",
+      "given": "any build",
+      "then": "the command exits 0"
+    }
+  ],
+  "command": [
+    "node",
+    "check.mjs"
+  ]
+}

@@ -1,6 +1,7 @@
 // A tiny loopback "application under test" for the self-tests. No dependencies, no network
 // beyond 127.0.0.1. PORT defaults to 18080; WIDGETS=off makes /widgets answer 404 (a "base" build
-// that does not have the feature yet).
+// that does not have the feature yet). /api/gadgets is the feature acceptance/3 proves: the base branch
+// of the PR that introduced it answers 404 there, so the spec was red on base and is green on head.
 import { createServer } from 'node:http';
 
 const port = Number(process.env.PORT ?? 18080);
@@ -13,6 +14,7 @@ const server = createServer((req, res) => {
   };
   if (req.url === '/api/healthz') return send(200, { status: 'ok' });
   if (req.url === '/api/widgets' && widgetsEnabled) return send(200, [{ id: 1, name: 'sprocket' }]);
+  if (req.url === '/api/gadgets') return send(200, [{ id: 1, name: 'cog' }]);
   return send(404, { error: 'no route' });
 });
 

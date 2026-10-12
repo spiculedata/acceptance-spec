@@ -32,6 +32,13 @@ on:
       node-version:
         type: string
         default: "22"
+    outputs:
+      verdict:
+        description: "pass, fail, or skipped (nothing owed). In mode report a fail still leaves the job green: read this."
+        value: ${{ jobs.convention.outputs.verdict || 'fail' }}
+      report-only:
+        description: "true when mode is report."
+        value: ${{ jobs.convention.outputs.report-only || 'false' }}
 
 permissions:
   contents: read
@@ -45,6 +52,9 @@ jobs:
     name: acceptance convention
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 5
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      report-only: ${{ steps.verdict.outputs.report-only }}
     steps:
       - name: Only for pull_request
         env:
@@ -109,4 +119,17 @@ jobs:
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           ACCEPTANCE_ENFORCE_FROM_ISSUE: ${{ inputs.enforce-from-issue }}
           ACCEPTANCE_MODE: ${{ inputs.mode }}
-        run: node "$RUNNER_TEMP/acceptance-scripts/acceptance-check.mjs" --changed-files "$RUNNER_TEMP/changed-files.txt"
+        run: |
+          rc=0
+          node "$RUNNER_TEMP/acceptance-scripts/acceptance-check.mjs" --changed-files "$RUNNER_TEMP/changed-files.txt" \
+            --json "$RUNNER_TEMP/convention-result.json" || rc=$?
+          exit "$rc"
+
+      # One clear verdict line (job summary, annotation title, workflow output), even when the check above
+      # failed or, in mode report, only warned. It never changes the job's result.
+      - name: Verdict
+        id: verdict
+        if: always()
+        env:
+          MODE: ${{ inputs.mode }}
+        run: node "$RUNNER_TEMP/acceptance-scripts/acceptance-verdict.mjs" --kind convention --input "$RUNNER_TEMP/convention-result.json" --mode "$MODE"

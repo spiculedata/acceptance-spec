@@ -1,0 +1,165 @@
+name: acceptance comment
+
+# Reusable workflow (on: workflow_call). Posts ONE sticky pull request comment that summarises the
+# acceptance jobs in a small table, found by a hidden marker and edited in place on every push (never a
+# new comment per push). It exists because `mode: report` keeps every job green even when a spec is red,
+# so the check marks hide the result; the comment shows it.
+#
+# Call it from a `pull_request` workflow ONLY, pinned to a full commit SHA, as its own job that needs the
+# others and is the ONLY job granted `pull-requests: write`:
+#   comment:
+#     needs: [convention, specs, spec-first]
+#     if: always()
+#     permissions: { contents: read, pull-requests: write }
+#     uses: spiculedata/acceptance-spec/.github/workflows/comment.yml@<40-char-sha>
+#     with: { comment: true, convention-verdict: ..., run-specs-verdict: ..., base-check-verdict: ..., report-only: ... }
+#
+# Trust model: this is the only workflow here with a write scope, and it is the least powerful job that
+# can hold it. It does NOT check out the caller's repository or run any PR code or PR text: it fetches
+# only this repository's scripts at the pinned ref, reads only the verdict strings its caller passes in,
+# and uses the token for two calls (list comments, create or update one). Fork PRs get a read-only token,
+# so the job is skipped for them. The jobs that DO execute PR code (build, start, specs) never get a
+# write scope.
+
+on:
+  workflow_call:
+    inputs:
+      comment:
+        description: "Opt in. Nothing is posted unless this is true."
+        type: boolean
+        default: false
+      convention-verdict:
+        description: "needs.<convention job>.outputs.verdict. Empty: that row is left out."
+        type: string
+        default: ""
+      run-specs-verdict:
+        description: "needs.<run-specs job>.outputs.verdict. Empty: that row is left out."
+        type: string
+        default: ""
+      base-check-verdict:
+        description: "needs.<base-check job>.outputs.verdict. Empty: that row is left out."
+        type: string
+        default: ""
+      report-only:
+        description: "true when the jobs ran with mode: report (adds a note to the comment)."
+        type: string
+        default: "false"
+      heading:
+        description: "Heading of the comment."
+        type: string
+        default: "Acceptance results"
+      runs-on:
+        type: string
+        default: ubuntu-latest
+      node-version:
+        type: string
+        default: "22"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  comment:
+    name: acceptance comment
+    # Same-repository PRs only: a fork's token is read-only and the call would only fail.
+    if: inputs.comment && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: acceptance-comment-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Only for pull_request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "::error::acceptance-spec workflows must be called from a pull_request workflow (got $EVENT_NAME). Use the plain pull_request trigger."
+            exit 1
+          fi
+
+      # job.workflow_repository / job.workflow_sha identify the REUSABLE workflow file that defines
+      # this job, i.e. this repository at the SHA the caller pinned in `uses:`. See README, "How the scripts are loaded".
+      - name: Guard the scripts ref
+        env:
+          WF_REPO: ${{ job.workflow_repository }}
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$WF_REPO" ] || ! printf '%s' "$WF_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::job.workflow_repository / job.workflow_sha are not populated; cannot load the scripts at the pinned ref."
+            exit 1
+          fi
+          echo "acceptance-spec scripts: $WF_REPO @ $WF_SHA"
+
+      # This is the only checkout in this workflow: this repository's scripts, never the caller's code.
+      - name: Fetch the acceptance-spec scripts (same pinned ref as this workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .acceptance-spec-src
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Move the scripts out of the workspace
+        env:
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C .acceptance-spec-src rev-parse HEAD)" = "$WF_SHA" ]
+          mv .acceptance-spec-src/scripts "$RUNNER_TEMP/acceptance-scripts"
+          rm -rf .acceptance-spec-src
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Render the comment
+        id: render
+        env:
+          CONVENTION_VERDICT: ${{ inputs.convention-verdict }}
+          RUN_SPECS_VERDICT: ${{ inputs.run-specs-verdict }}
+          BASE_CHECK_VERDICT: ${{ inputs.base-check-verdict }}
+          REPORT_ONLY: ${{ inputs.report-only }}
+          HEADING: ${{ inputs.heading }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          rc=0
+          node "$RUNNER_TEMP/acceptance-scripts/acceptance-comment.mjs" --out "$RUNNER_TEMP/comment.md" || rc=$?
+          if [ "$rc" -eq 3 ]; then echo "post=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+          echo "post=true" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # Find-and-update: the comment is found by its hidden marker AND by its author (the Actions bot), so
+      # a look-alike comment from anyone else is never edited. A failed call is a warning, not a red job:
+      # the comment is a convenience, the verdicts are also in each job summary.
+      - name: Create or update the sticky comment
+        if: steps.render.outputs.post == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          MARKER="$(node "$RUNNER_TEMP/acceptance-scripts/acceptance-comment.mjs" --marker)"
+          export MARKER
+          id=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains(env.MARKER))) | .id' | sed -n 1p) || id=""
+          if [ -n "$id" ]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$id" -F "body=@$RUNNER_TEMP/comment.md" > /dev/null \
+              && echo "Updated comment $id." \
+              || echo "::warning::Could not update the acceptance comment (is pull-requests: write granted to this job?)."
+          else
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" -F "body=@$RUNNER_TEMP/comment.md" > /dev/null \
+              && echo "Created the comment." \
+              || echo "::warning::Could not create the acceptance comment (is pull-requests: write granted to this job?)."
+          fi

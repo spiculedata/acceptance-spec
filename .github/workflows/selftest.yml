@@ -26,34 +26,86 @@ jobs:
       enforce-from-issue: "999999"
       mode: enforce
 
+  # The fixture has a build step (a copy into dist/) so the share-build path is exercised: run-specs
+  # uploads dist/, base-check (ordered after it) takes it instead of rebuilding head.
   run-specs:
     name: selftest / run-specs
     uses: ./.github/workflows/run-specs.yml
     with:
       working-directory: fixtures/consumer
-      start-command: PORT=18080 node server.mjs
+      build-command: mkdir -p dist && cp server.mjs dist/server.mjs
+      start-command: PORT=18080 node dist/server.mjs
       base-url: http://127.0.0.1:18080
       ready-url: http://127.0.0.1:18080/api/healthz
       ready-timeout: 30
       base-path: /api
       timeout-minutes: 10
+      share-build: true
+      share-build-paths: dist
 
   base-check:
     name: selftest / base-check
+    needs: [run-specs]
     uses: ./.github/workflows/base-check.yml
     with:
       working-directory: fixtures/consumer
-      start-command: PORT=18080 node server.mjs
+      build-command: mkdir -p dist && cp server.mjs dist/server.mjs
+      start-command: PORT=18080 node dist/server.mjs
       base-url: http://127.0.0.1:18080
       ready-url: http://127.0.0.1:18080/api/healthz
       ready-timeout: 30
       base-path: /api
       timeout-minutes: 10
+      share-build: true
+
+  # A spec that is red on head. mode: report keeps every job green, which is exactly the situation the
+  # verdict output is for: `assert-verdicts` below checks the output says fail while the job is green.
+  red-run-specs:
+    name: selftest / red run-specs
+    uses: ./.github/workflows/run-specs.yml
+    with:
+      working-directory: fixtures/red-on-head
+      mode: report
+      artifact-name: acceptance-results-red
+
+  red-base-check:
+    name: selftest / red base-check
+    uses: ./.github/workflows/base-check.yml
+    with:
+      working-directory: fixtures/red-on-head
+      mode: report
+      artifact-name: acceptance-base-check-red
+
+  green-base-check:
+    name: selftest / green-on-base base-check
+    uses: ./.github/workflows/base-check.yml
+    with:
+      working-directory: fixtures/green-on-base
+      mode: report
+      artifact-name: acceptance-base-check-green
+
+  # The sticky comment, for real, on this repository's own same-repository PRs (a fork PR's token is
+  # read-only, so the job is skipped there). Only this job holds pull-requests: write.
+  comment:
+    name: selftest / comment
+    needs: [convention, run-specs, base-check]
+    if: always()
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/comment.yml
+    with:
+      comment: true
+      heading: Acceptance self-test (fixture)
+      convention-verdict: ${{ needs.convention.outputs.verdict }}
+      run-specs-verdict: ${{ needs.run-specs.outputs.verdict }}
+      base-check-verdict: ${{ needs.base-check.outputs.verdict }}
+      report-only: "false"
 
   # Aggregate for this file, so one name says whether the self-tests are green.
   selftest:
     name: selftest
-    needs: [convention, run-specs, base-check]
+    needs: [convention, run-specs, base-check, red-run-specs, red-base-check, green-base-check, comment]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -62,10 +114,14 @@ jobs:
           CONVENTION: ${{ needs.convention.result }}
           RUN_SPECS: ${{ needs.run-specs.result }}
           BASE_CHECK: ${{ needs.base-check.result }}
+          RED_RUN_SPECS: ${{ needs.red-run-specs.result }}
+          RED_BASE_CHECK: ${{ needs.red-base-check.result }}
+          GREEN_BASE_CHECK: ${{ needs.green-base-check.result }}
+          COMMENT: ${{ needs.comment.result }}
         run: |
           set -euo pipefail
           fail=0
-          for entry in "convention=$CONVENTION" "run-specs=$RUN_SPECS" "base-check=$BASE_CHECK"; do
+          for entry in "convention=$CONVENTION" "run-specs=$RUN_SPECS" "base-check=$BASE_CHECK" "red-run-specs=$RED_RUN_SPECS" "red-base-check=$RED_BASE_CHECK" "green-base-check=$GREEN_BASE_CHECK" "comment=$COMMENT"; do
             name="${entry%%=*}"
             result="${entry#*=}"
             case "$result" in
@@ -73,4 +129,41 @@ jobs:
               *) echo "::error::$name=$result"; fail=1 ;;
             esac
           done
+          exit "$fail"
+
+  # The verdicts the callers see. A red spec in report mode leaves its job green, so this is the proof
+  # that the verdict output, not the job result, carries it. base-check only does real work on a PR that
+  # adds or changes a spec in its fixture, so on any other PR `skipped` is the expected verdict there.
+  assert-verdicts:
+    name: selftest / verdicts
+    needs: [convention, run-specs, base-check, red-run-specs, red-base-check, green-base-check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Each verdict is what the fixture should produce
+        env:
+          RUN_SPECS: ${{ needs.run-specs.outputs.verdict }}
+          RED_RUN_SPECS: ${{ needs.red-run-specs.outputs.verdict }}
+          RED_RUN_SPECS_RESULT: ${{ needs.red-run-specs.result }}
+          RED_RUN_SPECS_REPORT_ONLY: ${{ needs.red-run-specs.outputs.report-only }}
+          BASE_CHECK: ${{ needs.base-check.outputs.verdict }}
+          BUILD_REUSED: ${{ needs.base-check.outputs.build-reused }}
+          RED_BASE_CHECK: ${{ needs.red-base-check.outputs.verdict }}
+          GREEN_BASE_CHECK: ${{ needs.green-base-check.outputs.verdict }}
+        run: |
+          fail=0
+          expect() { # name actual allowed...
+            local name="$1" actual="$2"; shift 2
+            for ok in "$@"; do if [ "$actual" = "$ok" ]; then echo "ok: $name=$actual"; return; fi; done
+            echo "::error::$name=$actual, expected one of: $*"; fail=1
+          }
+          expect run-specs "$RUN_SPECS" pass
+          expect red-run-specs "$RED_RUN_SPECS" fail
+          expect "red-run-specs job result (report mode keeps it green)" "$RED_RUN_SPECS_RESULT" success
+          expect red-run-specs-report-only "$RED_RUN_SPECS_REPORT_ONLY" true
+          expect base-check "$BASE_CHECK" red-on-base-green-on-head skipped
+          expect red-base-check "$RED_BASE_CHECK" fail skipped
+          expect green-base-check "$GREEN_BASE_CHECK" passes-on-base skipped
+          # When base-check did real work, head must have been taken from run-specs, not rebuilt.
+          if [ "$BASE_CHECK" != "skipped" ]; then expect build-reused "$BUILD_REUSED" true; fi
           exit "$fail"
