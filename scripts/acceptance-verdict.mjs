@@ -28,12 +28,12 @@ const KINDS = {
 
 /** Plain-words meaning of each verdict, shared by the job summary and the sticky comment. */
 export const MEANINGS = {
-  pass: 'passed.',
-  'red-on-base-green-on-head': 'proven: the spec fails on the base branch and passes on this PR.',
-  fail: 'failed. Read the job for the reason.',
-  'passes-on-base': 'the spec already passes on the base branch, so it proves nothing about this change.',
-  'not-run': 'could not run here, so nothing is proven (for example a fork PR without the build token).',
-  skipped: 'nothing to check on this PR.'
+  pass: 'Everything that ran passed.',
+  'red-on-base-green-on-head': 'Proven: each new or changed spec fails on the base branch and passes on this PR.',
+  fail: 'Something is red or could not be proven. Read the job for the reason.',
+  'passes-on-base': 'A spec already passes on the base branch, so it proves nothing about this change.',
+  'not-run': 'It could not run here, so nothing is proven (for example a fork PR without the build token).',
+  skipped: 'Nothing to check on this PR.'
 };
 
 /** Convention result (acceptance-check --json) -> verdict. */
@@ -68,13 +68,13 @@ export function decideVerdict(kind, input) {
 /** One heading line for the job summary. */
 export function summaryHeading(kind, verdict, reportOnly) {
   const note = reportOnly && !GOOD.has(verdict) && !QUIET.has(verdict) ? ' This is report-only mode: the check itself stays green.' : '';
-  return `## ${KINDS[kind].title}: ${verdict}\n\n${KINDS[kind].title} ${MEANINGS[verdict]}${note}\n`;
+  return `## ${KINDS[kind].title}: ${verdict}\n\n${MEANINGS[verdict]}${note}\n`;
 }
 
 /** The annotation line: a `::notice` when fine, a `::warning` otherwise, always titled with the verdict. */
 export function annotation(kind, verdict) {
   const level = GOOD.has(verdict) || QUIET.has(verdict) ? 'notice' : 'warning';
-  return `::${level} title=acceptance ${kind}: ${verdict}::${KINDS[kind].title} ${MEANINGS[verdict]}`;
+  return `::${level} title=acceptance ${kind}: ${verdict}::${MEANINGS[verdict]}`;
 }
 
 function readJson(file) {

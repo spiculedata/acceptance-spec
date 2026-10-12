@@ -89,9 +89,9 @@ test('the comment starts with the hidden marker and has one plain-words row per 
   const text = renderComment({ verdicts, reportOnly: true, headSha: 'da497650b97d0a0764d23a5d6fb969e54aacd82c', runUrl: 'https://example.invalid/run/1' });
   assert.ok(text.startsWith(`${MARKER}\n`));
   assert.equal(text.split(MARKER).length, 2, 'the marker appears exactly once');
-  assert.match(text, /\| Convention \| \*\*Pass\*\* \|/);
-  assert.match(text, /\| Specs on this PR \| \*\*Fail\*\* \|/);
-  assert.match(text, /\| Spec-first proof \| \*\*Passes on base: proves nothing\*\* \|/);
+  assert.match(text, /\| Convention \(a closing PR ships its spec\) \| \*\*Pass\*\* \|/);
+  assert.match(text, /\| Specs on this PR's build \| \*\*Fail\*\* \|/);
+  assert.match(text, /\| Spec-first proof \(red on base, green on this PR\) \| \*\*Passes on base: proves nothing\*\* \|/);
   assert.match(text, /Report-only mode: a red result here does not turn the checks red/);
   assert.match(text, /commit da49765/);
   assert.match(text, /\[workflow run\]\(https:\/\/example\.invalid\/run\/1\)/);

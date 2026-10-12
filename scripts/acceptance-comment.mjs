@@ -18,14 +18,14 @@ import { MEANINGS, VERDICTS } from './acceptance-verdict.mjs';
 export const MARKER = '<!-- acceptance-spec:sticky-comment -->';
 
 const ROWS = [
-  ['convention', 'Convention', 'A PR that closes an issue ships its acceptance spec'],
-  ['runSpecs', 'Specs on this PR', 'Every acceptance spec against this PR\'s build'],
-  ['baseCheck', 'Spec-first proof', 'Each new or changed spec fails on the base branch and passes on this PR']
+  ['convention', 'Convention (a closing PR ships its spec)'],
+  ['runSpecs', 'Specs on this PR\'s build'],
+  ['baseCheck', 'Spec-first proof (red on base, green on this PR)']
 ];
 
 const WORDS = {
   pass: 'Pass',
-  'red-on-base-green-on-head': 'Proven (red on base, green on this PR)',
+  'red-on-base-green-on-head': 'Proven',
   fail: 'Fail',
   'passes-on-base': 'Passes on base: proves nothing',
   'not-run': 'Not run',
@@ -42,9 +42,9 @@ export function renderComment({ verdicts, reportOnly = false, headSha = '', runU
   const rows = ROWS.filter(([key]) => clean(verdicts?.[key]) !== '');
   const lines = [MARKER, `### ${String(heading).replace(/[\r\n<>]/g, ' ')}`, ''];
   lines.push('| Check | Result | What it means |', '| --- | --- | --- |');
-  for (const [key, name, what] of rows) {
+  for (const [key, name] of rows) {
     const verdict = clean(verdicts[key]);
-    lines.push(`| ${name} | **${WORDS[verdict]}** | ${what}: ${MEANINGS[verdict]} |`);
+    lines.push(`| ${name} | **${WORDS[verdict]}** | ${MEANINGS[verdict]} |`);
   }
   if (reportOnly) {
     lines.push('', 'Report-only mode: a red result here does not turn the checks red. Read this table, not the check marks.');
