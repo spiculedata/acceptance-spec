@@ -7,11 +7,13 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 const dir = join(import.meta.dirname, '..', '.github', 'workflows');
-const REUSABLE = ['convention.yml', 'run-specs.yml', 'base-check.yml', 'comment.yml'];
+const REUSABLE = ['convention.yml', 'run-specs.yml', 'base-check.yml', 'comment.yml', 'thin-caller-gate.yml'];
 // The jobs that build, start or run PR code. None of them may ever hold a write scope.
 const PR_CODE_WORKFLOWS = ['convention.yml', 'run-specs.yml', 'base-check.yml'];
 // comment.yml posts the sticky comment, and selftest.yml is its only caller here.
 const COMMENT_WRITERS = ['comment.yml', 'selftest.yml'];
+// pin-health.yml holds issues: write on its opt-in job only; selftest.yml is its only caller here.
+const ISSUE_WRITERS = ['pin-health.yml', 'selftest.yml'];
 const ALL = readdirSync(dir).filter((f) => f.endsWith('.yml'));
 
 const read = (file) => readFileSync(join(dir, file), 'utf8');
@@ -34,8 +36,9 @@ test('no workflow uses pull_request_target or workflow_run, or any write scope',
   for (const file of ALL) {
     const text = code(file);
     assert.doesNotMatch(text, /^\s*(pull_request_target|workflow_run)\s*:/m, file);
-    assert.doesNotMatch(text, /(?:contents|issues|actions|checks|statuses|id-token|packages|deployments): write/, file);
+    assert.doesNotMatch(text, /(?:contents|actions|checks|statuses|id-token|packages|deployments): write/, file);
     assert.match(text, /^permissions:\n {2}contents: read\n/m, `${file} declares contents: read at the top level`);
+    if (!ISSUE_WRITERS.includes(file)) assert.doesNotMatch(text, /issues: write/, `${file} has no issues scope`);
     if (!COMMENT_WRITERS.includes(file)) assert.doesNotMatch(text, /pull-requests/, `${file} has no pull-requests scope`);
   }
 });
@@ -174,4 +177,36 @@ test('convention.yml can be skipped (not failed) outside pull_request, for calle
   assert.match(text, /type: boolean\n\s+default: false/, 'off by default: another event is still an error');
   assert.match(text, /if: \$\{\{ !inputs\.skip-outside-pull-request \|\| github\.event_name == 'pull_request' \}\}/);
   assert.match(text, /"\$EVENT_NAME" != "pull_request"/, 'the guard step stays for callers that do not opt in');
+});
+
+// The second deliberate exception to "no write scope": the opt-in pin-health tracking issue.
+test('issues: write exists only on the opt-in pin-health issue job (and the selftest job that calls pin-health)', () => {
+  const lines = code('pin-health.yml').split('\n');
+  const hits = lines.filter((l) => /^\s*issues: write\s*$/.test(l));
+  assert.equal(hits.length, 1, 'exactly one issues: write');
+  assert.match(code('pin-health.yml'), /^ {2}open-issue:\n {4}name: [^\n]*\n {4}needs: report\n {4}if: \$\{\{ inputs\.open-issue \}\}\n[\s\S]*? {4}permissions:\n {6}issues: write\n/m, 'on the job gated by open-issue');
+  assert.match(code('pin-health.yml'), /open-issue:\n {8}description: [^\n]*\n {8}type: boolean\n {8}default: false\n/, 'opt-in, default false');
+  assert.match(code('selftest.yml'), /open-issue: false/, 'selftest never writes an issue');
+  const report = code('pin-health.yml').split(/^ {2}open-issue:\n/m)[0];
+  assert.doesNotMatch(report, /issues:/, 'the report job is read-only');
+});
+
+test('pin-health never edits a workflow and runs no caller code', () => {
+  const text = code('pin-health.yml');
+  assert.doesNotMatch(text, /git (commit|push)|gh pr |sed -i|contents: write/);
+  assert.doesNotMatch(text, /secrets\./);
+  assert.match(text, /^on:\n {2}workflow_call:[\s\S]*?\n {2}workflow_dispatch:/m);
+  assert.doesNotMatch(text, /^ {2}(push|pull_request|schedule):/m, 'the caller owns the schedule');
+  for (const line of runBodies(text)) assert.doesNotMatch(line, /\$\{\{/, `no expression interpolated into run: ${line.trim()}`);
+  assert.match(text, /repository: \$\{\{ job\.workflow_repository \}\}/);
+  assert.match(text, /rev-parse HEAD\)" = "\$WF_SHA"/);
+});
+
+test('thin-caller-gate.yml is static: no token, no secrets, no checkout of other code, skip handled inside', () => {
+  const text = code('thin-caller-gate.yml');
+  assert.doesNotMatch(text, /secrets\.|github\.token|GITHUB_TOKEN|issues|pull-requests/);
+  assert.match(text, /if: \$\{\{ !inputs\.skip-outside-pull-request \|\| github\.event_name == 'pull_request' \}\}/);
+  assert.match(text, /skip-outside-pull-request:\n\s+description:[^\n]*\n\s+type: boolean\n\s+default: false/);
+  assert.match(text, /^ {4}outputs:\n {6}verdict:\n/m);
+  assert.match(text, /thin-caller-gate\.mjs"/);
 });

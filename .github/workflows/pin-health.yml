@@ -1,0 +1,173 @@
+name: pin health
+
+# Reusable workflow (on: workflow_call, and workflow_dispatch for a manual run). Reports how far the
+# acceptance-spec commit a caller pins is behind acceptance-spec `main`: commits behind, whether the
+# changed files include scripts or workflows, and a link to the diff. It NEVER bumps a pin.
+#
+# By default it only writes a job summary. With `open-issue: true` it also opens, or updates in place,
+# ONE tracking issue titled "acceptance-spec pin health" in the caller repository. Only that opt-in
+# job holds `issues: write`; the reporting job is read-only.
+#
+# Typical scheduled caller (a separate workflow from the PR-time acceptance callers):
+#   on: { schedule: [{ cron: "0 7 * * 1" }], workflow_dispatch: {} }
+#   permissions: { contents: read }
+#   jobs:
+#     pin-health:
+#       permissions: { contents: read, issues: write }   # issues: write is required here even when open-issue is false (see below)
+#       uses: spiculedata/acceptance-spec/.github/workflows/pin-health.yml@<40-char-sha>
+#       with: { open-issue: false }
+#
+# A caller job can never grant a called workflow more than it holds itself, and GitHub validates the
+# called workflow's job permissions up front, so the calling job must hold `issues: write` even when
+# open-issue is false (the issue job is then skipped and never uses it).
+#
+# Trust model: no secrets. The report job has contents: read and calls the public GitHub compare API
+# with the workflow token, read-only. The issue job checks out nothing and runs no scripts: it receives
+# the finished Markdown through env and uses gh with the workflow token to create or edit one issue.
+# Not for pull_request_target.
+
+on:
+  workflow_call:
+    inputs:
+      open-issue:
+        description: "Opt in. true: open or update ONE tracking issue in the caller repository. false (default): job summary only."
+        type: boolean
+        default: false
+      spec-repository:
+        description: "The repository whose workflows are pinned."
+        type: string
+        default: spiculedata/acceptance-spec
+      spec-branch:
+        description: "The branch the pin is compared against."
+        type: string
+        default: main
+      working-directory:
+        description: "Root of the repository to scan (relative to the checkout). Leave at . except to self-test."
+        type: string
+        default: "."
+      runs-on:
+        type: string
+        default: ubuntu-latest
+      node-version:
+        type: string
+        default: "22"
+    outputs:
+      behind:
+        description: "Commits the furthest-behind pin is behind (0 when up to date)."
+        value: ${{ jobs.report.outputs.behind }}
+  workflow_dispatch:
+    inputs:
+      open-issue:
+        description: "Open or update the tracking issue (default: summary only)."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  report:
+    name: pin health report
+    runs-on: ${{ inputs.runs-on || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    outputs:
+      behind: ${{ steps.report.outputs.behind }}
+      markdown: ${{ steps.markdown.outputs.markdown }}
+    steps:
+      - name: Refuse pull_request_target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request_target" ]; then
+            echo "::error::pin-health must not run on pull_request_target."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Guard the scripts ref
+        env:
+          WF_REPO: ${{ job.workflow_repository }}
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$WF_REPO" ] || ! printf '%s' "$WF_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::job.workflow_repository / job.workflow_sha are not populated; cannot load the scripts at the pinned ref."
+            exit 1
+          fi
+          echo "acceptance-spec scripts: $WF_REPO @ $WF_SHA"
+
+      - name: Fetch the acceptance-spec scripts (same pinned ref as this workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .acceptance-spec-src
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Move the scripts out of the workspace
+        env:
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C .acceptance-spec-src rev-parse HEAD)" = "$WF_SHA" ]
+          mv .acceptance-spec-src/scripts "$RUNNER_TEMP/acceptance-scripts"
+          rm -rf .acceptance-spec-src
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version || '22' }}
+
+      - name: Compare the pinned SHA with the spec repository
+        id: report
+        working-directory: ${{ inputs.working-directory || '.' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SPEC_REPO: ${{ inputs.spec-repository || 'spiculedata/acceptance-spec' }}
+          SPEC_BRANCH: ${{ inputs.spec-branch || 'main' }}
+        run: |
+          set -euo pipefail
+          node "$RUNNER_TEMP/acceptance-scripts/pin-health.mjs" --root . --spec-repo "$SPEC_REPO" --branch "$SPEC_BRANCH" \
+            --summary "$GITHUB_STEP_SUMMARY" --markdown-out "$RUNNER_TEMP/pin-health.md"
+
+      - name: Expose the report to the opt-in issue job
+        id: markdown
+        run: |
+          set -euo pipefail
+          delimiter="EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          { echo "markdown<<$delimiter"; cat "$RUNNER_TEMP/pin-health.md"; echo "$delimiter"; } >> "$GITHUB_OUTPUT"
+
+  open-issue:
+    name: pin health issue
+    needs: report
+    if: ${{ inputs.open-issue }}
+    runs-on: ${{ inputs.runs-on || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the one tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BEHIND: ${{ needs.report.outputs.behind }}
+          REPORT: ${{ needs.report.outputs.markdown }}
+        run: |
+          set -euo pipefail
+          title="acceptance-spec pin health"
+          printf '%s\n\n<!-- acceptance-spec pin-health: edited in place by the scheduled workflow, never auto-closed -->\n' "$REPORT" > "$RUNNER_TEMP/body.md"
+          existing="$(gh issue list --state open --limit 100 --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)"
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body-file "$RUNNER_TEMP/body.md"
+            echo "updated issue #$existing"
+          elif [ "${BEHIND:-0}" -gt 0 ]; then
+            gh issue create --title "$title" --body-file "$RUNNER_TEMP/body.md"
+          else
+            echo "pin is up to date and no tracking issue is open; nothing to do"
+          fi

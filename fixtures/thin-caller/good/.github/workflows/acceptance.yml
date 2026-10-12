@@ -1,0 +1,15 @@
+name: acceptance
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  convention:
+    uses: spiculedata/acceptance-spec/.github/workflows/convention.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # pinned main commit
+    with:
+      enforce-from-issue: ${{ vars.ACCEPTANCE_ENFORCE_FROM_ISSUE }}
+      mode: report
+  specs:
+    uses: spiculedata/acceptance-spec/.github/workflows/run-specs.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    with:
+      mode: "enforce"

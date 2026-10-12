@@ -1,0 +1,150 @@
+name: thin-caller gate
+
+# Reusable workflow (on: workflow_call). A static drift check of a caller repository's acceptance
+# wiring, modelled on the thin-caller gate in projectbluefin/actions. It fails a PR when:
+#   pin-sha        a `uses:` of an acceptance-spec workflow is not pinned to a full 40-character SHA
+#   single-pin     the callers do not all pin the SAME SHA
+#   local-copy     the repository carries a copy of a shared script (acceptance-runner.mjs, ...)
+#                  that is not in the documented `allow-local-scripts` list
+#   visible-input  `mode` or `enforce-from-issue` is not a literal or a ${{ vars.NAME }}
+#
+# Call it from a `pull_request` workflow ONLY, pinned to a full commit SHA, with the SAME SHA as the
+# other acceptance callers:
+#   uses: spiculedata/acceptance-spec/.github/workflows/thin-caller-gate.yml@<40-char-sha>
+#
+# Trust model: contents: read, no secrets, no write scope, no token use. It reads the caller's
+# .github/workflows/*.yml and file names as text; nothing from the PR is executed or fetched.
+# Only this repository's script runs, loaded at the same pinned ref as this workflow.
+#
+# It always reports a result on a pull_request (a clean run when the PR touches neither
+# .github/workflows/** nor acceptance/**, unless only-when-relevant is false), so a path filter on the
+# caller can never leave a required check pending. For a caller that also runs on push or merge_group,
+# set skip-outside-pull-request: the job is then skipped inside this workflow, not via an `if:` on the
+# calling job, which would report a bare check named after the caller job.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "enforce (findings fail the job) or report (findings are warnings; read the verdict output)."
+        type: string
+        default: enforce
+      allow-local-scripts:
+        description: "Newline-separated paths a caller may keep despite matching a shared script name. A path ending in / allows a directory. Document the reason next to the caller."
+        type: string
+        default: ""
+      spec-repository:
+        description: "The repository whose workflows are being pinned."
+        type: string
+        default: spiculedata/acceptance-spec
+      only-when-relevant:
+        description: "When true, a PR that changes neither .github/workflows/ nor acceptance/ gets a clean 'skipped' verdict without scanning."
+        type: boolean
+        default: true
+      skip-outside-pull-request:
+        description: "For a caller that also runs on push or merge_group: when true, the job is SKIPPED on any event but pull_request instead of failing. Use this rather than an `if:` on the calling job, because a skipped calling job reports a bare check named after the caller job, which can shadow a required check of that name. Default false: any other event is an error."
+        type: boolean
+        default: false
+      working-directory:
+        description: "Root of the repository to scan (relative to the checkout). Leave at . except to self-test."
+        type: string
+        default: "."
+      runs-on:
+        type: string
+        default: ubuntu-latest
+      node-version:
+        type: string
+        default: "22"
+    outputs:
+      verdict:
+        description: "pass, fail, or skipped. In mode report a fail still leaves the job green: read this."
+        value: ${{ jobs.gate.outputs.verdict || 'fail' }}
+      findings:
+        description: "Number of drift findings."
+        value: ${{ jobs.gate.outputs.findings || '0' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gate:
+    name: thin-caller gate
+    if: ${{ !inputs.skip-outside-pull-request || github.event_name == 'pull_request' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    outputs:
+      verdict: ${{ steps.gate.outputs.verdict }}
+      findings: ${{ steps.gate.outputs.findings }}
+    steps:
+      - name: Only for pull_request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "::error::acceptance-spec workflows must be called from a pull_request workflow (got $EVENT_NAME). Use the plain pull_request trigger."
+            exit 1
+          fi
+          case "$MODE" in enforce|report) ;; *) echo "::error::mode must be enforce or report, got '$MODE'"; exit 1 ;; esac
+
+      # Two commits of history: the checkout is the merge of the PR into its base, so HEAD^1 is the
+      # base and `git diff HEAD^1 HEAD` is exactly the PR's change set.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Guard the scripts ref
+        env:
+          WF_REPO: ${{ job.workflow_repository }}
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$WF_REPO" ] || ! printf '%s' "$WF_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::job.workflow_repository / job.workflow_sha are not populated; cannot load the scripts at the pinned ref."
+            exit 1
+          fi
+          echo "acceptance-spec scripts: $WF_REPO @ $WF_SHA"
+
+      - name: Fetch the acceptance-spec scripts (same pinned ref as this workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .acceptance-spec-src
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Move the scripts out of the workspace
+        env:
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C .acceptance-spec-src rev-parse HEAD)" = "$WF_SHA" ]
+          mv .acceptance-spec-src/scripts "$RUNNER_TEMP/acceptance-scripts"
+          rm -rf .acceptance-spec-src
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: The PR's changed files
+        working-directory: ${{ inputs.working-directory }}
+        run: git diff --relative --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed-files.txt"
+
+      - name: Check the acceptance wiring for drift
+        id: gate
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MODE: ${{ inputs.mode }}
+          ALLOW_LOCAL: ${{ inputs.allow-local-scripts }}
+          SPEC_REPO: ${{ inputs.spec-repository }}
+          ONLY_WHEN_RELEVANT: ${{ inputs.only-when-relevant }}
+        run: |
+          set -euo pipefail
+          args=(--root . --spec-repo "$SPEC_REPO" --mode "$MODE" --allow-local "$ALLOW_LOCAL" --summary "$GITHUB_STEP_SUMMARY")
+          if [ "$ONLY_WHEN_RELEVANT" = "true" ]; then args+=(--changed-files "$RUNNER_TEMP/changed-files.txt"); fi
+          node "$RUNNER_TEMP/acceptance-scripts/thin-caller-gate.mjs" "${args[@]}"
