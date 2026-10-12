@@ -9,8 +9,9 @@ A checklist per repository. Do it in one PR, in report-only mode first.
    read. Never a branch.
 3. **Find the cutoff.** Read the live latest issue number of the repository (for example
    `gh api 'repos/{owner}/{repo}/issues?state=all&per_page=1' --jq '.[0].number'`; issues and PRs share one
-   number space, and the newest of either is the right ceiling). Use that number as `enforce-from-issue`: only issues opened after
-   adoption owe a spec.
+   number space, and the newest of either is the right ceiling). Use that number **plus one** as `enforce-from-issue`
+   (the check enforces issues numbered at or above it, so the latest number itself would still owe a spec): only
+   issues opened after adoption owe a spec.
 4. **Create the labels** (once per repository; both are human-applied and nothing in CI applies them):
    ```bash
    gh label create acceptance-waived --description "Docs-only or tests-only PR: no acceptance spec needed" --color 0e8a16
