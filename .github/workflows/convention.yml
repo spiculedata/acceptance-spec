@@ -30,6 +30,10 @@ on:
         description: "Optional. Newline-separated JavaScript regular expressions, matched against repository-relative paths, that REPLACE the built-in documentation-and-tests list for the acceptance-waived label. Give the complete list (documentation patterns too). Empty: the built-in list."
         type: string
         default: ""
+      skip-outside-pull-request:
+        description: "For a caller that also runs on push or merge_group (a CI workflow with a required aggregate): when true, the convention job is SKIPPED on any event but pull_request instead of failing. Use this rather than an `if:` on the calling job, because a skipped calling job reports a bare check named after the caller job, which can shadow a required check of that name. Default false: any other event is an error."
+        type: boolean
+        default: false
       runs-on:
         type: string
         default: ubuntu-latest
@@ -54,6 +58,7 @@ defaults:
 jobs:
   convention:
     name: acceptance convention
+    if: ${{ !inputs.skip-outside-pull-request || github.event_name == 'pull_request' }}
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 5
     outputs:

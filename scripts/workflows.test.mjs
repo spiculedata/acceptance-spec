@@ -167,3 +167,11 @@ test('convention.yml passes waivable-paths to the script through env only', () =
   assert.match(text, /waivable-paths:\n\s+description:/);
   assert.match(text, /ACCEPTANCE_WAIVABLE_PATHS: \$\{\{ inputs\.waivable-paths \}\}/);
 });
+
+test('convention.yml can be skipped (not failed) outside pull_request, for callers that also run on push or merge_group', () => {
+  const text = code('convention.yml');
+  assert.match(text, /skip-outside-pull-request:\n\s+description:/);
+  assert.match(text, /type: boolean\n\s+default: false/, 'off by default: another event is still an error');
+  assert.match(text, /if: \$\{\{ !inputs\.skip-outside-pull-request \|\| github\.event_name == 'pull_request' \}\}/);
+  assert.match(text, /"\$EVENT_NAME" != "pull_request"/, 'the guard step stays for callers that do not opt in');
+});
