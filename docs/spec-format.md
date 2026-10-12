@@ -100,6 +100,10 @@ documentation (`docs/`, `*.md`, `.github/ISSUE_TEMPLATE/`) or a test (`src/test/
 `tests/`, `test/`, `*.test.*`, `*.spec.*`, `*.e2e.*`). A PR touching anything else, or with no changed files, is
 held as if the label were absent, and the check names the disqualifying files.
 
+The built-in list is deliberately generous (any `e2e/` directory, a top-level `test/` or `tests/`). A repository
+that wants its exact layout sets the `waivable-paths` input of `convention.yml` (one regular expression per line):
+it replaces the built-in list entirely, so it must include the documentation patterns too.
+
 **Spec first.** Commit `acceptance/N/spec.json` before the implementation. `base-check.yml` runs every spec a
 PR adds or changes against the base commit's build and the PR's build. Per spec, the message says which case you are in:
 

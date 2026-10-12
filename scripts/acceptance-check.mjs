@@ -15,7 +15,8 @@
 //
 // All inputs default to the environment variables the workflow sets:
 // PR_BODY, PR_LABELS (comma separated), PR_CHANGED_FILES (newline separated),
-// ACCEPTANCE_ENFORCE_FROM_ISSUE. Exit 0 when the convention is satisfied, 1 when it is not,
+// ACCEPTANCE_ENFORCE_FROM_ISSUE, ACCEPTANCE_WAIVABLE_PATHS (optional: newline separated regular
+// expressions that REPLACE the built-in docs-and-tests list for the waiver). Exit 0 when the convention is satisfied, 1 when it is not,
 // 2 on bad input. `--mode report` (or ACCEPTANCE_MODE=report) prints the problems as warnings and
 // exits 0: for a repository that is rolling the convention out.
 
@@ -28,6 +29,7 @@ import {
   SPEC_FILE,
   WAIVER_LABEL,
   decideRequirement,
+  parseWaivablePaths,
   validateSpec
 } from './acceptance-spec.mjs';
 
@@ -68,10 +70,11 @@ export function check({
   labels = [],
   enforceFrom = 0,
   changedFiles,
+  waivablePaths,
   log = () => {}
 }) {
   const present = presentIssues(repoRoot, log);
-  const decision = decideRequirement({ body, labels, presentIssues: present, enforceFrom, changedFiles });
+  const decision = decideRequirement({ body, labels, presentIssues: present, enforceFrom, changedFiles, waivablePaths });
 
   const problems = [];
   if (!decision.ok) {
@@ -205,6 +208,14 @@ function main(argv) {
   const mode = opts.mode ?? process.env.ACCEPTANCE_MODE ?? 'enforce';
   if (mode !== 'enforce' && mode !== 'report') usage(`--mode must be enforce or report, got "${mode}"`);
 
+  let waivablePaths = null;
+  try {
+    waivablePaths = parseWaivablePaths(process.env.ACCEPTANCE_WAIVABLE_PATHS);
+  } catch (err) {
+    process.stderr.write(`acceptance-check: ${err.message}\n`);
+    return 2;
+  }
+
   let result;
   try {
     result = check({
@@ -213,6 +224,7 @@ function main(argv) {
       labels,
       enforceFrom,
       changedFiles,
+      waivablePaths,
       log: (s) => process.stdout.write(`${s}\n`)
     });
   } catch (err) {

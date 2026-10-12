@@ -26,6 +26,10 @@ on:
         description: "Directory that holds acceptance/ (relative to the repository root)."
         type: string
         default: "."
+      waivable-paths:
+        description: "Optional. Newline-separated JavaScript regular expressions, matched against repository-relative paths, that REPLACE the built-in documentation-and-tests list for the acceptance-waived label. Give the complete list (documentation patterns too). Empty: the built-in list."
+        type: string
+        default: ""
       runs-on:
         type: string
         default: ubuntu-latest
@@ -119,6 +123,7 @@ jobs:
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           ACCEPTANCE_ENFORCE_FROM_ISSUE: ${{ inputs.enforce-from-issue }}
           ACCEPTANCE_MODE: ${{ inputs.mode }}
+          ACCEPTANCE_WAIVABLE_PATHS: ${{ inputs.waivable-paths }}
         run: |
           rc=0
           node "$RUNNER_TEMP/acceptance-scripts/acceptance-check.mjs" --changed-files "$RUNNER_TEMP/changed-files.txt" \
