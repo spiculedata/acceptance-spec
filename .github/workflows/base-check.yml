@@ -462,10 +462,8 @@ jobs:
           fi
           if [ "$skip" = true ] && [ -n "$START_COMMAND" ]; then base_url=""; fi
           # Cache paths are relative to the working directory; prefix them with the base tree.
-          paths=""
-          while IFS= read -r p; do
-            if [ -n "$p" ]; then paths="${paths}base/${WORKDIR}/${p}"$'\n'; fi
-          done <<< "$CACHE_PATHS"
+          paths="$(WORKDIR="$WORKDIR" CACHE_PATHS="$CACHE_PATHS" bash "$RUNNER_TEMP/acceptance-scripts/prefix-cache-paths.sh")"
+          if [ -n "$paths" ]; then paths="${paths}"$'\n'; fi
           # The key covers what shaped the cached output, so a changed build command never reuses a stale one.
           fingerprint=$(printf '%s\0%s\0%s\0%s' "$BUILD_COMMAND" "$CACHE_PATHS" "$WORKDIR" "$JAVA_VERSION" | sha256sum | cut -c1-16)
           {
