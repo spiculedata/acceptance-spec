@@ -231,7 +231,8 @@ export function decideRequirement({
   presentIssues = [],
   waivers = [WAIVER_LABEL],
   enforceFrom = 0,
-  changedFiles
+  changedFiles,
+  waivablePaths
 } = {}) {
   const closing = closingIssues(body);
   const wanted = (waivers ?? []).map((l) => String(l).toLowerCase());
@@ -259,7 +260,7 @@ export function decideRequirement({
     // The waiver is for docs-only and tests-only PRs. When the change list is
     // known, hold the PR to that; an empty list does not qualify.
     if (Array.isArray(changedFiles)) {
-      const offending = nonWaivableFiles(changedFiles);
+      const offending = nonWaivableFiles(changedFiles, waivablePaths ?? undefined);
       if (changedFiles.length === 0 || offending.length > 0) {
         return {
           required,
@@ -300,8 +301,34 @@ const WAIVABLE_PATHS = [
   /\.e2e\.[cm]?[jt]s$/
 ];
 
-/** The changed files that are neither documentation nor tests. */
-export const nonWaivableFiles = (files) => files.filter((f) => !WAIVABLE_PATHS.some((re) => re.test(String(f))));
+/**
+ * Parse a repository's own waivable-path list: one JavaScript regular expression source per line,
+ * matched against repository-relative paths with forward slashes. Blank lines and lines starting with
+ * `#` are skipped. Returns null when the text holds no pattern (use the built-in list). Throws on an
+ * expression that does not compile, so a typo fails the check loudly instead of waiving everything or
+ * nothing.
+ */
+export function parseWaivablePaths(text) {
+  const patterns = [];
+  for (const raw of String(text ?? '').split('\n')) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    try {
+      patterns.push(new RegExp(line));
+    } catch (err) {
+      throw new Error(`waivable-paths: "${line}" is not a valid regular expression (${err.message})`);
+    }
+  }
+  return patterns.length > 0 ? patterns : null;
+}
+
+/**
+ * The changed files that are neither documentation nor tests. `patterns` replaces the built-in list
+ * entirely when a repository states its exact layout (`waivable-paths`), so it must include its
+ * documentation patterns too.
+ */
+export const nonWaivableFiles = (files, patterns = WAIVABLE_PATHS) =>
+  files.filter((f) => !patterns.some((re) => re.test(String(f))));
 
 /** @deprecated name kept for existing imports; the waiver now also covers tests. */
 export const nonDocsFiles = nonWaivableFiles;

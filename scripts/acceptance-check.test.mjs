@@ -18,6 +18,7 @@ import {
   interpolate,
   lookupJson,
   parseJsonPath,
+  parseWaivablePaths,
   validateSpec,
   verdictFor,
   WAIVER_LABEL
@@ -439,4 +440,59 @@ test('--mode report prints the problems as warnings and exits 0; enforce (the de
   assert.equal(enforce.status, 1);
   const bad = spawnSync(process.execPath, [cli, '--repo-root', root, '--mode', 'nope'], { encoding: 'utf8', env });
   assert.equal(bad.status, 2);
+});
+
+// ------------------------------------------------- waivable-paths: a repository's own layout
+
+const STRICT_LAYOUT = ['^docs/', '\\.md$', '^\\.github/ISSUE_TEMPLATE/', '(^|/)src/test/', '^saiku-ui/e2e/', '^tests/'].join('\n');
+
+test('parseWaivablePaths reads one regular expression per line and skips blanks and comments', () => {
+  const patterns = parseWaivablePaths('# docs\n^docs/\n\n  \\.md$  \n');
+  assert.equal(patterns.length, 2);
+  assert.ok(patterns[0].test('docs/a.txt') && patterns[1].test('README.md'));
+  assert.equal(parseWaivablePaths(''), null);
+  assert.equal(parseWaivablePaths(undefined), null);
+  assert.equal(parseWaivablePaths('# only a comment\n'), null);
+});
+
+test('parseWaivablePaths rejects an expression that does not compile, naming it', () => {
+  assert.throws(() => parseWaivablePaths('^docs/\n(unclosed'), /"\(unclosed" is not a valid regular expression/);
+});
+
+test('a repository list replaces the built-in one: a stricter layout refuses what the default waives', () => {
+  const changedFiles = ['saiku-core/e2e/Foo.java'];
+  const inputs = { body: 'Closes #1500', labels: [WAIVER_LABEL], presentIssues: [], changedFiles };
+  assert.equal(decideRequirement(inputs).waived, true, 'the built-in list waives any e2e/ directory');
+  const strict = decideRequirement({ ...inputs, waivablePaths: parseWaivablePaths(STRICT_LAYOUT) });
+  assert.equal(strict.waived, false);
+  assert.deepEqual(strict.waiverRejected.files, ['saiku-core/e2e/Foo.java']);
+  const ok = decideRequirement({ ...inputs, changedFiles: ['saiku-ui/e2e/a.spec.ts', 'docs/a.md', 'tests/x.sh'], waivablePaths: parseWaivablePaths(STRICT_LAYOUT) });
+  assert.equal(ok.waived, true);
+});
+
+test('a repository list that omits a built-in pattern no longer waives it (the list is the whole truth)', () => {
+  const only = parseWaivablePaths('^docs/');
+  const decision = decideRequirement({ body: 'Closes #1500', labels: [WAIVER_LABEL], presentIssues: [], changedFiles: ['README.md'], waivablePaths: only });
+  assert.equal(decision.waived, false);
+});
+
+test('the CLI reads ACCEPTANCE_WAIVABLE_PATHS; a bad expression is bad input (exit 2), never a silent waiver', () => {
+  const root = repo({});
+  const dir = mkdtempSync(join(tmpdir(), 'acceptance-waivable-'));
+  const list = join(dir, 'files.txt');
+  writeFileSync(list, 'saiku-core/e2e/Foo.java\n');
+  const env = { PATH: process.env.PATH, PR_BODY: 'Closes #50', PR_LABELS: WAIVER_LABEL, ACCEPTANCE_ENFORCE_FROM_ISSUE: '1' };
+  const cli = join(import.meta.dirname, 'acceptance-check.mjs');
+  const args = [cli, '--repo-root', root, '--changed-files', list];
+
+  const defaults = spawnSync(process.execPath, args, { encoding: 'utf8', env });
+  assert.equal(defaults.status, 0, defaults.stdout + defaults.stderr);
+
+  const strict = spawnSync(process.execPath, args, { encoding: 'utf8', env: { ...env, ACCEPTANCE_WAIVABLE_PATHS: STRICT_LAYOUT } });
+  assert.equal(strict.status, 1, strict.stdout + strict.stderr);
+  assert.match(strict.stdout, /saiku-core\/e2e\/Foo\.java/);
+
+  const bad = spawnSync(process.execPath, args, { encoding: 'utf8', env: { ...env, ACCEPTANCE_WAIVABLE_PATHS: '(unclosed' } });
+  assert.equal(bad.status, 2, bad.stdout + bad.stderr);
+  assert.match(bad.stderr, /not a valid regular expression/);
 });

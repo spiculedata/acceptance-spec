@@ -161,3 +161,9 @@ test('base-check keeps the saiku proof: base cache on the base SHA, the human-ap
 test('this repo\'s own ci.yml has the aggregate job named ci', () => {
   assert.match(code('ci.yml'), /^ {2}ci:\n {4}name: ci\n/m);
 });
+
+test('convention.yml passes waivable-paths to the script through env only', () => {
+  const text = code('convention.yml');
+  assert.match(text, /waivable-paths:\n\s+description:/);
+  assert.match(text, /ACCEPTANCE_WAIVABLE_PATHS: \$\{\{ inputs\.waivable-paths \}\}/);
+});

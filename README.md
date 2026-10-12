@@ -147,6 +147,7 @@ Common to `run-specs.yml` and `base-check.yml` unless marked.
 | `comment`, `*-verdict`, `report-only`, `heading` | `false`, empty | `comment.yml` only; see above. |
 | `base-cache-paths` | empty | `base-check` only. Newline-separated build outputs, relative to `working-directory`, cached on the base SHA. Empty: the base is always built. |
 | `enforce-from-issue` | required | `convention` only. Issues numbered below this owe no spec. Empty or not a number enforces nothing. |
+| `waivable-paths` | empty | `convention` only. Newline-separated JavaScript regular expressions (repository-relative paths, forward slashes) that **replace** the built-in docs-and-tests list for the `acceptance-waived` label. Give the whole list, documentation patterns included. Use it to state your exact test layout instead of the generous `(^|/)e2e/` default. An expression that does not compile fails the job. |
 
 Secrets (all optional, declared by name because reusable workflows cannot take dynamic secret names):
 `ACCEPTANCE_USER`, `ACCEPTANCE_PASSWORD` (credentials for `auth: session | basic`; use a low-privilege
