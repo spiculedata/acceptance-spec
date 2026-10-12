@@ -84,6 +84,62 @@ jobs:
       mode: report
       artifact-name: acceptance-base-check-green
 
+  # The thin-caller gate against fixtures/thin-caller. `good` is wired as a caller should be and must pass.
+  # `drifted` is wired wrongly on purpose (a branch pin, two different SHAs, a local copy of a shared
+  # script). In mode report it keeps the job green and the verdict says fail, which assert-verdicts checks.
+  thin-caller-good:
+    name: selftest / thin-caller good
+    uses: ./.github/workflows/thin-caller-gate.yml
+    with:
+      working-directory: fixtures/thin-caller/good
+      only-when-relevant: false
+      mode: enforce
+
+  thin-caller-drifted:
+    name: selftest / thin-caller drifted
+    uses: ./.github/workflows/thin-caller-gate.yml
+    with:
+      working-directory: fixtures/thin-caller/drifted
+      only-when-relevant: false
+      mode: report
+
+  # The same drifted fixture in mode enforce must FAIL the gate. A failing reusable-workflow call cannot be
+  # inverted inside a workflow, so the script the workflow runs is invoked directly and its exit code asserted.
+  thin-caller-drift-must-fail:
+    name: selftest / thin-caller drift fails
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - name: Enforce mode exits 1 on the drifted fixture
+        run: |
+          rc=0
+          node scripts/thin-caller-gate.mjs --root fixtures/thin-caller/drifted --mode enforce > "$RUNNER_TEMP/drift.log" || rc=$?
+          cat "$RUNNER_TEMP/drift.log"
+          if [ "$rc" -ne 1 ]; then echo "::error::expected exit 1 on the drifted fixture, got $rc"; exit 1; fi
+          for rule in pin-sha single-pin local-copy visible-input; do
+            grep -q "\[$rule\]" "$RUNNER_TEMP/drift.log" || { echo "::error::no $rule finding on the drifted fixture"; exit 1; }
+          done
+
+  # Pin health against fixtures/pin-health (it pins a real, old commit of this repository). Report only:
+  # open-issue stays false, so nothing is written. The calling job holds issues: write only because a
+  # called workflow cannot be granted a scope its caller lacks, and pin-health.yml declares it on its
+  # opt-in job.
+  pin-health:
+    name: selftest / pin-health
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/pin-health.yml
+    with:
+      working-directory: fixtures/pin-health
+      open-issue: false
+
   # The sticky comment, for real, on this repository's own same-repository PRs (a fork PR's token is
   # read-only, so the job is skipped there). Only this job holds pull-requests: write.
   comment:
@@ -105,7 +161,7 @@ jobs:
   # Aggregate for this file, so one name says whether the self-tests are green.
   selftest:
     name: selftest
-    needs: [convention, run-specs, base-check, red-run-specs, red-base-check, green-base-check, comment]
+    needs: [convention, run-specs, base-check, red-run-specs, red-base-check, green-base-check, comment, thin-caller-good, thin-caller-drifted, thin-caller-drift-must-fail, pin-health]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -118,10 +174,14 @@ jobs:
           RED_BASE_CHECK: ${{ needs.red-base-check.result }}
           GREEN_BASE_CHECK: ${{ needs.green-base-check.result }}
           COMMENT: ${{ needs.comment.result }}
+          THIN_GOOD: ${{ needs.thin-caller-good.result }}
+          THIN_DRIFTED: ${{ needs.thin-caller-drifted.result }}
+          THIN_MUST_FAIL: ${{ needs.thin-caller-drift-must-fail.result }}
+          PIN_HEALTH: ${{ needs.pin-health.result }}
         run: |
           set -euo pipefail
           fail=0
-          for entry in "convention=$CONVENTION" "run-specs=$RUN_SPECS" "base-check=$BASE_CHECK" "red-run-specs=$RED_RUN_SPECS" "red-base-check=$RED_BASE_CHECK" "green-base-check=$GREEN_BASE_CHECK" "comment=$COMMENT"; do
+          for entry in "convention=$CONVENTION" "run-specs=$RUN_SPECS" "base-check=$BASE_CHECK" "red-run-specs=$RED_RUN_SPECS" "red-base-check=$RED_BASE_CHECK" "green-base-check=$GREEN_BASE_CHECK" "comment=$COMMENT" "thin-caller-good=$THIN_GOOD" "thin-caller-drifted=$THIN_DRIFTED" "thin-caller-drift-must-fail=$THIN_MUST_FAIL" "pin-health=$PIN_HEALTH"; do
             name="${entry%%=*}"
             result="${entry#*=}"
             case "$result" in
@@ -136,7 +196,7 @@ jobs:
   # adds or changes a spec in its fixture, so on any other PR `skipped` is the expected verdict there.
   assert-verdicts:
     name: selftest / verdicts
-    needs: [convention, run-specs, base-check, red-run-specs, red-base-check, green-base-check]
+    needs: [convention, run-specs, base-check, red-run-specs, red-base-check, green-base-check, thin-caller-good, thin-caller-drifted, pin-health]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -150,6 +210,11 @@ jobs:
           BUILD_REUSED: ${{ needs.base-check.outputs.build-reused }}
           RED_BASE_CHECK: ${{ needs.red-base-check.outputs.verdict }}
           GREEN_BASE_CHECK: ${{ needs.green-base-check.outputs.verdict }}
+          THIN_GOOD: ${{ needs.thin-caller-good.outputs.verdict }}
+          THIN_DRIFTED: ${{ needs.thin-caller-drifted.outputs.verdict }}
+          THIN_DRIFTED_RESULT: ${{ needs.thin-caller-drifted.result }}
+          THIN_DRIFTED_FINDINGS: ${{ needs.thin-caller-drifted.outputs.findings }}
+          PIN_BEHIND: ${{ needs.pin-health.outputs.behind }}
         run: |
           fail=0
           expect() { # name actual allowed...
@@ -166,4 +231,9 @@ jobs:
           expect green-base-check "$GREEN_BASE_CHECK" passes-on-base skipped
           # When base-check did real work, head must have been taken from run-specs, not rebuilt.
           if [ "$BASE_CHECK" != "skipped" ]; then expect build-reused "$BUILD_REUSED" true; fi
+          expect thin-caller-good "$THIN_GOOD" pass
+          expect thin-caller-drifted "$THIN_DRIFTED" fail
+          expect "thin-caller-drifted job result (report mode keeps it green)" "$THIN_DRIFTED_RESULT" success
+          expect thin-caller-drifted-findings "$THIN_DRIFTED_FINDINGS" 6
+          if ! [[ "$PIN_BEHIND" =~ ^[0-9]+$ ]]; then echo "::error::pin-health behind='$PIN_BEHIND', expected a number"; fail=1; else echo "ok: pin-health behind=$PIN_BEHIND"; fi
           exit "$fail"

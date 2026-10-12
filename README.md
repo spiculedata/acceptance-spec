@@ -207,7 +207,7 @@ The same goes for editing the PR body to add a closing keyword.
 
 ## The workflows
 
-The first three do the work; the fourth, `comment.yml`, is optional. All are GitHub reusable workflows (`on: workflow_call`). Call them from a `pull_request` workflow,
+The first three do the work; `comment.yml` is optional; `thin-caller-gate.yml` and `pin-health.yml` are guards (see "Guarding a caller's wiring"). All are GitHub reusable workflows (`on: workflow_call`). Call them from a `pull_request` workflow,
 never `pull_request_target`, pinned to a **full commit SHA**:
 
 | Workflow | What it does |
@@ -216,6 +216,9 @@ never `pull_request_target`, pinned to a **full commit SHA**:
 | `run-specs.yml` | Builds the caller's app, starts it, and runs every `acceptance/<N>/spec.json` against it. `command` specs always run; `api` specs run only when a base URL is available, otherwise they are `not-run`, never `pass`. |
 | `base-check.yml` | Red on base, green on head: every spec a PR adds or changes must fail on the base commit's build and pass on the PR's build. A spec that already passes on base fails the check unless a human applied `spec-already-green`. A spec that is not green on the PR build fails it with "not green on the PR build yet: implement the feature or fix the spec". Self-contained (builds and runs both sides) and caches the base build on the base SHA. |
 | `comment.yml` | Optional. Posts one sticky PR comment summarising the three verdicts in a small table (see "Seeing the result"). The only workflow here with a write scope, and only when a caller opts in. |
+
+| `thin-caller-gate.yml` | Guard. A static check that a caller's wiring has not drifted from this design (see "Guarding a caller's wiring"). Read-only, no secrets. |
+| `pin-health.yml` | Guard. Reports how far the pinned SHA is behind `main`; optionally keeps one tracking issue. Never bumps (see "Guarding a caller's wiring"). |
 
 ### Copy-paste caller for a generic repository
 
@@ -349,6 +352,77 @@ Secrets (all optional, declared by name because reusable workflows cannot take d
 account on a disposable instance) and `BUILD_TOKEN` (exposed to `build-command` as `$BUILD_TOKEN`, for
 example a private package registry token). `secrets: inherit` is never needed.
 
+## Guarding a caller's wiring
+
+Two small reusable guards keep a caller thin and current. Both are static or read-only, and neither runs
+any of the caller's code. They are separate from the three workflows above, so adopt them after the
+caller works (`docs/adopting.md`, "Adopt the guards").
+
+### `thin-caller-gate.yml`: fail a PR that has drifted
+
+Static check over `.github/workflows/*.yml` and the file tree. It fails the PR when:
+
+| Rule | Fails when |
+|---|---|
+| `pin-sha` | a `uses:` of an acceptance-spec workflow is not pinned to a full 40-character lowercase SHA (a tag, a branch or a short SHA) |
+| `single-pin` | the callers pin more than one SHA |
+| `local-copy` | the repository holds a file named like a shared script (`acceptance-runner.mjs`, `acceptance-check.mjs`, `acceptance-base-check.mjs`, `acceptance-spec.mjs`, `start-server.sh`, `stop-server.sh`) outside the `allow-local-scripts` list |
+| `visible-input` | `mode` or `enforce-from-issue` is anything but a literal (`enforce`/`report`, digits) or `${{ vars.NAME }}` |
+| `no-callers` | no workflow calls the spec repository at all |
+
+It reads nothing but workflow text and file names: `contents: read`, no secrets, no token use. It always
+reports a result on a pull_request, so a path filter on the caller cannot leave a required check pending:
+a PR that touches neither `.github/workflows/` nor `acceptance/` gets a clean `skipped` verdict without
+scanning (`only-when-relevant: false` scans anyway). Callers that also run on push or merge_group set
+`skip-outside-pull-request: true`, same as `convention.yml`, instead of putting an `if:` on the calling job
+(a skipped calling job reports a bare check that can shadow a required one). Outputs: `verdict`
+(`pass`, `fail`, `skipped`) and `findings`. `mode: report` turns findings into warnings.
+
+```yaml
+# .github/workflows/thin-caller-gate.yml in the caller
+name: thin-caller-gate
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  thin-caller-gate:
+    uses: spiculedata/acceptance-spec/.github/workflows/thin-caller-gate.yml@<same-40-char-sha-as-the-other-callers>
+    with:
+      mode: report          # then enforce
+      # allow-local-scripts: |
+      #   ci/acceptance-runner.mjs   # reason: needs the Maven wrapper, tracked in issue 123
+```
+
+### `pin-health.yml`: how stale is the pin?
+
+Compares the SHA the caller pins with this repository's `main` through the GitHub compare API and writes a
+job summary: commits behind, whether the changed files include `scripts/` or `.github/workflows/` (with the
+first few listed), and the diff link. With `open-issue: true` it also opens, or edits in place, ONE issue
+titled "acceptance-spec pin health" (never closed automatically, one issue however often it runs). It never
+changes a workflow: bumping is a human decision. Only the opt-in issue job holds `issues: write`.
+
+```yaml
+# .github/workflows/acceptance-pin-health.yml in the caller
+name: acceptance-pin-health
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pin-health:
+    permissions:
+      contents: read
+      issues: write     # a called workflow cannot hold a scope its caller lacks; used only if open-issue is true
+    uses: spiculedata/acceptance-spec/.github/workflows/pin-health.yml@<same-40-char-sha-as-the-other-callers>
+    with:
+      open-issue: false # default; true opens/updates the tracking issue
+```
+
+Run it on `schedule` and `workflow_dispatch`, not on pull requests.
+
 ## The spec format
 
 See [`docs/spec-format.md`](docs/spec-format.md). In short:
@@ -459,6 +533,10 @@ Differences a saiku migration must account for (also listed in the extraction PR
 | `ACCEPTANCE_ENFORCE_FROM_ISSUE` repo variable | `enforce-from-issue` input (pass `${{ vars.ACCEPTANCE_ENFORCE_FROM_ISSUE }}` to keep the variable) |
 
 ## Verification
+
+`selftest.yml` also runs both guards: `thin-caller-gate` on `fixtures/thin-caller/good` (must pass) and on
+`fixtures/thin-caller/drifted` (a branch pin, two SHAs, a local script copy and non-literal inputs; must
+produce the `fail` verdict, and exit 1 in enforce mode), and `pin-health` on `fixtures/pin-health`.
 
 Unit tests, the loopback fixture end to end (`scripts/e2e-fixture.test.mjs`) and the workflow guard tests
 run in `ci.yml`. `selftest.yml` calls the three reusable workflows against `fixtures/consumer` from this

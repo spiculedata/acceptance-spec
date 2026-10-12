@@ -1,0 +1,11 @@
+name: acceptance
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  convention:
+    uses: spiculedata/acceptance-spec/.github/workflows/convention.yml@da497650b97d0a0764d23a5d6fb969e54aacd82c
+    with:
+      enforce-from-issue: "1"
+      mode: report

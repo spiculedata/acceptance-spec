@@ -33,7 +33,24 @@ A checklist per repository. Do it in one PR, in report-only mode first.
 10. **Make report mode readable (optional).** In `mode: report` red does not turn a check red. Add the
     `comment` job from the README ("Seeing the result") to get one sticky PR comment with the three verdicts.
     Give `pull-requests: write` to that job only, never to the jobs that build or run specs.
-11. **Bump later** by replacing the SHA in every `uses:` line (see the README).
+11. **Adopt the guards (optional, recommended).** See "Adopt the guards" below.
+12. **Bump later** by replacing the SHA in every `uses:` line (see the README).
+
+## Adopt the guards
+
+Once the caller works, add both guards in a second small PR. Use the SAME 40-character SHA as the
+acceptance callers; the gate fails if they differ.
+
+1. **`thin-caller-gate`** (PR check). Add `.github/workflows/thin-caller-gate.yml` from the README
+   ("Guarding a caller's wiring") with `mode: report`. Fix what it reports: pin every `uses:` to the one
+   SHA, delete local copies of shared scripts (or list a path in `allow-local-scripts` and write down why),
+   and make `mode` / `enforce-from-issue` literals or repository variables. Then switch it to `enforce`.
+   If the workflow ever also runs on `push` or `merge_group`, set `skip-outside-pull-request: true`.
+   If you make it a required check, require the caller job's check name as the repository shows it.
+2. **`pin-health`** (scheduled). Add `.github/workflows/acceptance-pin-health.yml` from the README. Start
+   with `open-issue: false` and read the job summary. Set `open-issue: true` only if you want a tracking
+   issue; the calling job needs `issues: write` either way (a called workflow cannot hold a scope its
+   caller lacks). It never bumps; when it says you are behind, follow "Bump later" in step 12.
 
 ## After the first adoption: confirm the cross-repository `uses:`
 
