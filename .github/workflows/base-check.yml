@@ -1,0 +1,612 @@
+name: acceptance base check
+
+# Reusable workflow (on: workflow_call). "Red on base, green on head": every
+# acceptance/<issue>/spec.json a PR ADDS OR CHANGES must FAIL against the build of the PR's base
+# commit and PASS against the PR's own build. A spec that already passes on base proves nothing and
+# fails the check, unless a HUMAN applied the `spec-already-green` label. A PR that touches no spec
+# pays almost nothing: `detect` runs for seconds and the rest is skipped.
+#
+# Self-contained: it builds and runs both sides itself (head and base in parallel), so it does not
+# depend on run-specs.yml having run. The base build can be cached on the base SHA (base-cache-paths).
+#
+# Call it from a `pull_request` workflow ONLY, pinned to a full commit SHA:
+#   uses: spiculedata/acceptance-spec/.github/workflows/base-check.yml@<40-char-sha>
+#
+# Trust model: contents: read, no write scope, no new trigger. The runner and the spec files come from
+# the PR; the code under test and the cwd of command specs come from the base checkout with the PR's spec
+# directories copied over it. A fork PR has no BUILD_TOKEN: nothing is built, api specs are `not-run`
+# on both sides and the verdict is `not-run`, never `pass`. The label is read from the event payload,
+# so apply it BEFORE pushing, or close and reopen the PR.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory (relative to the repo root) that holds acceptance/ and is the cwd of build and start."
+        type: string
+        default: "."
+      build-command:
+        description: "Shell command that builds the app under test (run on head and on base). Empty: no build."
+        type: string
+        default: ""
+      start-command:
+        description: "Shell command that starts the app and keeps running. Empty: nothing is started."
+        type: string
+        default: ""
+      base-url:
+        description: "Origin of the server under test, e.g. http://127.0.0.1:8080. Empty: api specs are not-run."
+        type: string
+        default: ""
+      ready-url:
+        description: "URL polled until it answers 2xx after start-command. Default: base-url."
+        type: string
+        default: ""
+      ready-timeout:
+        type: number
+        default: 300
+      base-path:
+        type: string
+        default: ""
+      session-path:
+        type: string
+        default: ""
+      base-cache-paths:
+        description: "Newline-separated build outputs, relative to working-directory, to cache on the base SHA (for example target/app.jar). Empty: no caching, the base is always built."
+        type: string
+        default: ""
+      skip-without-build-token:
+        description: "When true and the BUILD_TOKEN secret is empty (fork PRs), skip build and start; api specs are not-run."
+        type: boolean
+        default: false
+      mode:
+        description: "enforce (a failing proof fails the job) or report (it is only a warning)."
+        type: string
+        default: enforce
+      node-version:
+        type: string
+        default: "22"
+      java-version:
+        type: string
+        default: ""
+      java-cache:
+        type: string
+        default: ""
+      runs-on:
+        type: string
+        default: ubuntu-latest
+      timeout-minutes:
+        type: number
+        default: 25
+      artifact-name:
+        type: string
+        default: acceptance-base-check
+    secrets:
+      ACCEPTANCE_USER:
+        required: false
+      ACCEPTANCE_PASSWORD:
+        required: false
+      BUILD_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Cheap (seconds): which acceptance/<issue>/spec.json did this PR add or change? The checkout is the
+  # merge of the PR into its base, so HEAD^1 is the base and `git diff HEAD^1 HEAD` is the PR's change set.
+  detect:
+    name: detect changed specs
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    outputs:
+      has_specs: ${{ steps.diff.outputs.has_specs }}
+      issues: ${{ steps.diff.outputs.issues }}
+      base_sha: ${{ steps.diff.outputs.base_sha }}
+    steps:
+      - name: Only for pull_request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "::error::acceptance-spec workflows must be called from a pull_request workflow (got $EVENT_NAME). Use the plain pull_request trigger."
+            exit 1
+          fi
+          case "$MODE" in enforce|report) ;; *) echo "::error::mode must be enforce or report, got '$MODE'"; exit 1 ;; esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      # job.workflow_repository / job.workflow_sha identify the REUSABLE workflow file that defines
+      # this job, i.e. this repository at the SHA the caller pinned in `uses:`. See README, "How the scripts are loaded".
+      - name: Guard the scripts ref
+        env:
+          WF_REPO: ${{ job.workflow_repository }}
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$WF_REPO" ] || ! printf '%s' "$WF_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::job.workflow_repository / job.workflow_sha are not populated; cannot load the scripts at the pinned ref."
+            exit 1
+          fi
+          echo "acceptance-spec scripts: $WF_REPO @ $WF_SHA"
+
+      - name: Fetch the acceptance-spec scripts (same pinned ref as this workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .acceptance-spec-src
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Move the scripts out of the workspace
+        env:
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C .acceptance-spec-src rev-parse HEAD)" = "$WF_SHA" ]
+          mv .acceptance-spec-src/scripts "$RUNNER_TEMP/acceptance-scripts"
+          rm -rf .acceptance-spec-src
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Changed acceptance specs
+        id: diff
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          # --relative: paths are relative to the working directory, and only it is considered.
+          git diff --relative --name-status HEAD^1 HEAD -- 'acceptance/*/spec.json' > "$RUNNER_TEMP/changed-specs.txt"
+          ISSUES=$(node "$RUNNER_TEMP/acceptance-scripts/acceptance-base-check.mjs" --changed "$RUNNER_TEMP/changed-specs.txt" --list)
+          echo "Changed specs: ${ISSUES:-none}"
+          {
+            echo "issues=$ISSUES"
+            echo "base_sha=$(git rev-parse HEAD^1)"
+            if [ -n "$ISSUES" ]; then echo "has_specs=true"; else echo "has_specs=false"; fi
+          } >> "$GITHUB_OUTPUT"
+
+  # The PR's build, running only the changed specs.
+  head-run:
+    name: specs on head
+    needs: detect
+    if: needs.detect.outputs.has_specs == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      CHANGED_ISSUES: ${{ needs.detect.outputs.issues }}
+    steps:
+      - name: Only for pull_request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "::error::acceptance-spec workflows must be called from a pull_request workflow (got $EVENT_NAME). Use the plain pull_request trigger."
+            exit 1
+          fi
+          case "$MODE" in enforce|report) ;; *) echo "::error::mode must be enforce or report, got '$MODE'"; exit 1 ;; esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # job.workflow_repository / job.workflow_sha identify the REUSABLE workflow file that defines
+      # this job, i.e. this repository at the SHA the caller pinned in `uses:`. See README, "How the scripts are loaded".
+      - name: Guard the scripts ref
+        env:
+          WF_REPO: ${{ job.workflow_repository }}
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$WF_REPO" ] || ! printf '%s' "$WF_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::job.workflow_repository / job.workflow_sha are not populated; cannot load the scripts at the pinned ref."
+            exit 1
+          fi
+          echo "acceptance-spec scripts: $WF_REPO @ $WF_SHA"
+
+      - name: Fetch the acceptance-spec scripts (same pinned ref as this workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .acceptance-spec-src
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Move the scripts out of the workspace
+        env:
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C .acceptance-spec-src rev-parse HEAD)" = "$WF_SHA" ]
+          mv .acceptance-spec-src/scripts "$RUNNER_TEMP/acceptance-scripts"
+          rm -rf .acceptance-spec-src
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Set up Java
+        if: inputs.java-version != ''
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: ${{ inputs.java-cache }}
+      - name: Decide whether the app can be built
+        id: decide
+        env:
+          BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
+          SKIP_WITHOUT_TOKEN: ${{ inputs.skip-without-build-token }}
+          START_COMMAND: ${{ inputs.start-command }}
+          INPUT_BASE_URL: ${{ inputs.base-url }}
+        run: |
+          skip=false
+          base_url="$INPUT_BASE_URL"
+          if [ "$SKIP_WITHOUT_TOKEN" = "true" ] && [ -z "${BUILD_TOKEN:-}" ]; then
+            skip=true
+            echo "::warning::BUILD_TOKEN is not available (fork PR): the app cannot be built, so api specs are recorded not-run."
+            if [ -n "$START_COMMAND" ]; then base_url=""; fi
+          fi
+          { echo "skip=$skip"; echo "base_url=$base_url"; } >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        if: inputs.build-command != '' && steps.decide.outputs.skip != 'true'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+          BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
+        run: bash -eo pipefail -c "$BUILD_COMMAND"
+
+      - name: Start the app
+        if: inputs.start-command != '' && steps.decide.outputs.skip != 'true'
+        env:
+          START_COMMAND: ${{ inputs.start-command }}
+          READY_URL: ${{ inputs.ready-url || inputs.base-url }}
+          READY_TIMEOUT: ${{ inputs.ready-timeout }}
+          WORKDIR: ${{ inputs.working-directory }}
+          LOG_FILE: ${{ runner.temp }}/acceptance-server-head.log
+        run: bash "$RUNNER_TEMP/acceptance-scripts/start-server.sh"
+
+      # A spec that FAILS on head is reported by the verdict job; only bad input (2+) stops this job.
+      - name: Run the changed specs on head
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ACCEPTANCE_USER: ${{ secrets.ACCEPTANCE_USER }}
+          ACCEPTANCE_PASSWORD: ${{ secrets.ACCEPTANCE_PASSWORD }}
+          ACCEPTANCE_BASE_PATH: ${{ inputs.base-path }}
+          ACCEPTANCE_SESSION_PATH: ${{ inputs.session-path }}
+          ACCEPTANCE_BASE_URL: ${{ steps.decide.outputs.base_url }}
+        run: |
+          ARGS=()
+          for n in $CHANGED_ISSUES; do ARGS+=(--dir "acceptance/$n"); done
+          rc=0
+          node "$RUNNER_TEMP/acceptance-scripts/acceptance-runner.mjs" run "${ARGS[@]}" \
+            --out "$RUNNER_TEMP/acceptance-head-results.json" || rc=$?
+          if [ "$rc" -gt 1 ]; then exit "$rc"; fi
+
+      - name: Stop the app
+        if: always()
+        env:
+          PID_FILE: ${{ runner.temp }}/acceptance-server.pid
+        run: bash "$RUNNER_TEMP/acceptance-scripts/stop-server.sh"
+
+      - name: Upload the head-side results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}-head-${{ github.run_id }}
+          path: ${{ runner.temp }}/acceptance-head-results.json
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+
+      - name: Upload the server log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-name }}-head-log-${{ github.run_id }}
+          path: ${{ runner.temp }}/acceptance-server-head.log
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
+
+  # The BASE commit's build, running the same changed specs. The runner and the spec files come from
+  # the PR (`head/`); the code under test and the cwd of command specs come from the base checkout
+  # (`base/`) with the PR's spec directories copied over it. Runs in parallel with head-run. The build
+  # outputs named in base-cache-paths are cached on the base SHA, so a re-push to the same PR (same
+  # base) skips the build.
+  base-run:
+    name: specs on base
+    needs: detect
+    if: needs.detect.outputs.has_specs == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      CHANGED_ISSUES: ${{ needs.detect.outputs.issues }}
+      BASE_SHA: ${{ needs.detect.outputs.base_sha }}
+      WORKDIR: ${{ inputs.working-directory }}
+    steps:
+      - name: Only for pull_request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "::error::acceptance-spec workflows must be called from a pull_request workflow (got $EVENT_NAME). Use the plain pull_request trigger."
+            exit 1
+          fi
+          case "$MODE" in enforce|report) ;; *) echo "::error::mode must be enforce or report, got '$MODE'"; exit 1 ;; esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.detect.outputs.base_sha }}
+          path: base
+          persist-credentials: false
+
+      # job.workflow_repository / job.workflow_sha identify the REUSABLE workflow file that defines
+      # this job, i.e. this repository at the SHA the caller pinned in `uses:`. See README, "How the scripts are loaded".
+      - name: Guard the scripts ref
+        env:
+          WF_REPO: ${{ job.workflow_repository }}
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$WF_REPO" ] || ! printf '%s' "$WF_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::job.workflow_repository / job.workflow_sha are not populated; cannot load the scripts at the pinned ref."
+            exit 1
+          fi
+          echo "acceptance-spec scripts: $WF_REPO @ $WF_SHA"
+
+      - name: Fetch the acceptance-spec scripts (same pinned ref as this workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .acceptance-spec-src
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Move the scripts out of the workspace
+        env:
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C .acceptance-spec-src rev-parse HEAD)" = "$WF_SHA" ]
+          mv .acceptance-spec-src/scripts "$RUNNER_TEMP/acceptance-scripts"
+          rm -rf .acceptance-spec-src
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Put the PR's changed specs into the base tree
+        id: tree
+        run: |
+          set -euo pipefail
+          # A base without the working directory (a brand-new sub-project) has nothing to build or start.
+          if [ -d "base/$WORKDIR" ]; then has_base=true; else has_base=false; fi
+          mkdir -p "base/$WORKDIR/acceptance"
+          for n in $CHANGED_ISSUES; do
+            rm -rf "base/$WORKDIR/acceptance/$n"
+            cp -R "head/$WORKDIR/acceptance/$n" "base/$WORKDIR/acceptance/$n"
+          done
+          echo "has_base=$has_base" >> "$GITHUB_OUTPUT"
+          [ "$has_base" = true ] || echo "::warning::$WORKDIR does not exist on the base commit; nothing to build there, api specs are recorded not-run."
+
+      - name: Decide whether the base app can be built
+        id: decide
+        env:
+          BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
+          SKIP_WITHOUT_TOKEN: ${{ inputs.skip-without-build-token }}
+          START_COMMAND: ${{ inputs.start-command }}
+          INPUT_BASE_URL: ${{ inputs.base-url }}
+          HAS_BASE: ${{ steps.tree.outputs.has_base }}
+          CACHE_PATHS: ${{ inputs.base-cache-paths }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
+          JAVA_VERSION: ${{ inputs.java-version }}
+        run: |
+          skip=false
+          base_url="$INPUT_BASE_URL"
+          if [ "$HAS_BASE" != "true" ]; then
+            skip=true
+          elif [ "$SKIP_WITHOUT_TOKEN" = "true" ] && [ -z "${BUILD_TOKEN:-}" ]; then
+            skip=true
+            echo "::warning::BUILD_TOKEN is not available (fork PR): the base app cannot be built, so api specs are recorded not-run."
+          fi
+          if [ "$skip" = true ] && [ -n "$START_COMMAND" ]; then base_url=""; fi
+          # Cache paths are relative to the working directory; prefix them with the base tree.
+          paths=""
+          while IFS= read -r p; do
+            if [ -n "$p" ]; then paths="${paths}base/${WORKDIR}/${p}"$'\n'; fi
+          done <<< "$CACHE_PATHS"
+          # The key covers what shaped the cached output, so a changed build command never reuses a stale one.
+          fingerprint=$(printf '%s\0%s\0%s\0%s' "$BUILD_COMMAND" "$CACHE_PATHS" "$WORKDIR" "$JAVA_VERSION" | sha256sum | cut -c1-16)
+          {
+            echo "skip=$skip"
+            echo "base_url=$base_url"
+            echo "cache_key=acceptance-base-v1-${BASE_SHA}-${fingerprint}"
+            echo "cache_paths<<EOF_PATHS"
+            printf '%s' "$paths"
+            echo "EOF_PATHS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore the cached base build
+        id: cache
+        if: steps.decide.outputs.skip != 'true' && steps.decide.outputs.cache_paths != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.decide.outputs.cache_paths }}
+          key: ${{ steps.decide.outputs.cache_key }}
+
+      # Unconditional: a cache hit still needs the toolchain to RUN the cached output.
+      - name: Set up Java
+        if: inputs.java-version != ''
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: ${{ inputs.java-cache }}
+      - name: Build the BASE app
+        if: inputs.build-command != '' && steps.decide.outputs.skip != 'true' && steps.cache.outputs.cache-hit != 'true'
+        working-directory: base/${{ inputs.working-directory }}
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+          BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
+        run: bash -eo pipefail -c "$BUILD_COMMAND"
+
+      - name: Save the base build for re-runs on the same base
+        if: steps.decide.outputs.skip != 'true' && steps.decide.outputs.cache_paths != '' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.decide.outputs.cache_paths }}
+          key: ${{ steps.decide.outputs.cache_key }}
+
+      - name: Start the base app
+        if: inputs.start-command != '' && steps.decide.outputs.skip != 'true'
+        env:
+          START_COMMAND: ${{ inputs.start-command }}
+          READY_URL: ${{ inputs.ready-url || inputs.base-url }}
+          READY_TIMEOUT: ${{ inputs.ready-timeout }}
+          WORKDIR: base/${{ inputs.working-directory }}
+          LOG_FILE: ${{ runner.temp }}/acceptance-server-base.log
+          PID_FILE: ${{ runner.temp }}/acceptance-server-base.pid
+        run: bash "$RUNNER_TEMP/acceptance-scripts/start-server.sh"
+
+      # A spec that FAILS here is the expected outcome (exit 1 is fine); only bad input (2+) stops the job.
+      - name: Run the changed specs against the base
+        working-directory: base/${{ inputs.working-directory }}
+        env:
+          ACCEPTANCE_USER: ${{ secrets.ACCEPTANCE_USER }}
+          ACCEPTANCE_PASSWORD: ${{ secrets.ACCEPTANCE_PASSWORD }}
+          ACCEPTANCE_BASE_PATH: ${{ inputs.base-path }}
+          ACCEPTANCE_SESSION_PATH: ${{ inputs.session-path }}
+          ACCEPTANCE_BASE_URL: ${{ steps.decide.outputs.base_url }}
+        run: |
+          ARGS=()
+          for n in $CHANGED_ISSUES; do ARGS+=(--dir "acceptance/$n"); done
+          if [ -z "$ACCEPTANCE_BASE_URL" ]; then
+            echo "::notice::No base server; api specs are recorded as not-run."
+          fi
+          rc=0
+          node "$RUNNER_TEMP/acceptance-scripts/acceptance-runner.mjs" run "${ARGS[@]}" \
+            --out "$RUNNER_TEMP/acceptance-base-results.json" || rc=$?
+          if [ "$rc" -gt 1 ]; then exit "$rc"; fi
+
+      - name: Stop the base app
+        if: always()
+        env:
+          PID_FILE: ${{ runner.temp }}/acceptance-server-base.pid
+        run: bash "$RUNNER_TEMP/acceptance-scripts/stop-server.sh"
+
+      - name: Upload the base-side results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}-base-${{ github.run_id }}
+          path: ${{ runner.temp }}/acceptance-base-results.json
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+
+      - name: Upload the base server log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-name }}-base-log-${{ github.run_id }}
+          path: ${{ runner.temp }}/acceptance-server-base.log
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
+
+  # The proof: every spec the PR added or changed must be red on base and green on head. Read-only and
+  # cheap; waits for both builds. The PR's labels come from the event payload (like `acceptance-waived`),
+  # so a label added after the run started takes effect on the next push or a close/reopen, not a re-run.
+  verdict:
+    name: spec fails on base
+    needs: [detect, head-run, base-run]
+    if: always() && needs.detect.outputs.has_specs == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    steps:
+      - name: Only for pull_request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "::error::acceptance-spec workflows must be called from a pull_request workflow (got $EVENT_NAME). Use the plain pull_request trigger."
+            exit 1
+          fi
+          case "$MODE" in enforce|report) ;; *) echo "::error::mode must be enforce or report, got '$MODE'"; exit 1 ;; esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      # job.workflow_repository / job.workflow_sha identify the REUSABLE workflow file that defines
+      # this job, i.e. this repository at the SHA the caller pinned in `uses:`. See README, "How the scripts are loaded".
+      - name: Guard the scripts ref
+        env:
+          WF_REPO: ${{ job.workflow_repository }}
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$WF_REPO" ] || ! printf '%s' "$WF_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::job.workflow_repository / job.workflow_sha are not populated; cannot load the scripts at the pinned ref."
+            exit 1
+          fi
+          echo "acceptance-spec scripts: $WF_REPO @ $WF_SHA"
+
+      - name: Fetch the acceptance-spec scripts (same pinned ref as this workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .acceptance-spec-src
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Move the scripts out of the workspace
+        env:
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C .acceptance-spec-src rev-parse HEAD)" = "$WF_SHA" ]
+          mv .acceptance-spec-src/scripts "$RUNNER_TEMP/acceptance-scripts"
+          rm -rf .acceptance-spec-src
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Head-side results
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.artifact-name }}-head-${{ github.run_id }}
+          path: head-results
+      - name: Base-side results
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.artifact-name }}-base-${{ github.run_id }}
+          path: base-results
+      - name: Each changed spec is red on base and green on head
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BASE_JOB_RESULT: ${{ needs.base-run.result }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          git diff --relative --name-status HEAD^1 HEAD -- 'acceptance/*/spec.json' > "$RUNNER_TEMP/changed-specs.txt"
+          rc=0
+          node "$RUNNER_TEMP/acceptance-scripts/acceptance-base-check.mjs" \
+            --changed "$RUNNER_TEMP/changed-specs.txt" \
+            --head "$GITHUB_WORKSPACE/head-results/acceptance-head-results.json" \
+            --base "$GITHUB_WORKSPACE/base-results/acceptance-base-results.json" \
+            --base-job-result "$BASE_JOB_RESULT" \
+            --labels "$PR_LABELS" \
+            --mode "$MODE" \
+            --out "$RUNNER_TEMP/spec-first-verdict.json" > "$RUNNER_TEMP/spec-first.md" || rc=$?
+          cat "$RUNNER_TEMP/spec-first.md"
+          grep -v '^::' "$RUNNER_TEMP/spec-first.md" >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$rc"

@@ -1,0 +1,16 @@
+{
+  "issue": 2,
+  "title": "a command spec reaches the app through ACCEPTANCE_BASE_URL",
+  "kind": "command",
+  "criteria": [
+    {
+      "id": "C1",
+      "given": "a running app",
+      "then": "the command exits 0 after GET /api/healthz answers 200"
+    }
+  ],
+  "command": [
+    "node",
+    "check.mjs"
+  ]
+}

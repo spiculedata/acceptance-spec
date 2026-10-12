@@ -1,0 +1,76 @@
+name: selftest
+
+# Calls this repository's OWN reusable workflows against fixtures/consumer, so a change here is
+# proven end to end on a loopback fixture server (no external network). Callers in other
+# repositories reference these workflows as
+#   spiculedata/acceptance-spec/.github/workflows/<name>.yml@<full-sha>
+# whereas this file uses the local ./ form; that cross-repository `uses:` is the part that cannot be
+# exercised from here before the workflows exist at a SHA on main (see README, "Verification").
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: selftest-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  convention:
+    name: selftest / convention
+    uses: ./.github/workflows/convention.yml
+    with:
+      # A cutoff far above any real issue: the gate runs for real and reports "not enforced".
+      enforce-from-issue: "999999"
+      mode: enforce
+
+  run-specs:
+    name: selftest / run-specs
+    uses: ./.github/workflows/run-specs.yml
+    with:
+      working-directory: fixtures/consumer
+      start-command: PORT=18080 node server.mjs
+      base-url: http://127.0.0.1:18080
+      ready-url: http://127.0.0.1:18080/api/healthz
+      ready-timeout: 30
+      base-path: /api
+      timeout-minutes: 10
+
+  base-check:
+    name: selftest / base-check
+    uses: ./.github/workflows/base-check.yml
+    with:
+      working-directory: fixtures/consumer
+      start-command: PORT=18080 node server.mjs
+      base-url: http://127.0.0.1:18080
+      ready-url: http://127.0.0.1:18080/api/healthz
+      ready-timeout: 30
+      base-path: /api
+      timeout-minutes: 10
+
+  # Aggregate for this file, so one name says whether the self-tests are green.
+  selftest:
+    name: selftest
+    needs: [convention, run-specs, base-check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify upstream jobs passed or were skipped
+        env:
+          CONVENTION: ${{ needs.convention.result }}
+          RUN_SPECS: ${{ needs.run-specs.result }}
+          BASE_CHECK: ${{ needs.base-check.result }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for entry in "convention=$CONVENTION" "run-specs=$RUN_SPECS" "base-check=$BASE_CHECK"; do
+            name="${entry%%=*}"
+            result="${entry#*=}"
+            case "$result" in
+              success|skipped) echo "ok: $name=$result" ;;
+              *) echo "::error::$name=$result"; fail=1 ;;
+            esac
+          done
+          exit "$fail"
