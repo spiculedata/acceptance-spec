@@ -1,0 +1,112 @@
+name: acceptance convention
+
+# Reusable workflow (on: workflow_call). A PR that closes issue N (N >= enforce-from-issue) must
+# ship acceptance/N/spec.json. A human-applied `acceptance-waived` label waives docs-only and
+# tests-only PRs, and the waiver is verified against the files the PR changed.
+#
+# Call it from a `pull_request` workflow ONLY, pinned to a full commit SHA:
+#   uses: spiculedata/acceptance-spec/.github/workflows/convention.yml@<40-char-sha>
+#
+# Trust model: contents: read, no secrets, no write scope. The PR body is untrusted text; it
+# reaches the script through env, is parsed into integers, and never lands on a command line.
+# Nothing from the PR is executed: only this repo's script reads the PR's spec.json files.
+
+on:
+  workflow_call:
+    inputs:
+      enforce-from-issue:
+        description: "Only issues numbered at or above this owe a spec. Empty or not a number enforces nothing."
+        type: string
+        required: true
+      mode:
+        description: "enforce (a missing spec fails the job) or report (it is only a warning)."
+        type: string
+        default: enforce
+      working-directory:
+        description: "Directory that holds acceptance/ (relative to the repository root)."
+        type: string
+        default: "."
+      runs-on:
+        type: string
+        default: ubuntu-latest
+      node-version:
+        type: string
+        default: "22"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  convention:
+    name: acceptance convention
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    steps:
+      - name: Only for pull_request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "::error::acceptance-spec workflows must be called from a pull_request workflow (got $EVENT_NAME). Use the plain pull_request trigger."
+            exit 1
+          fi
+          case "$MODE" in enforce|report) ;; *) echo "::error::mode must be enforce or report, got '$MODE'"; exit 1 ;; esac
+
+      # Two commits of history: the checkout is the merge of the PR into its base, so HEAD^1 is the
+      # base and `git diff HEAD^1 HEAD` is exactly the PR's change set. The waiver is verified against it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      # job.workflow_repository / job.workflow_sha identify the REUSABLE workflow file that defines
+      # this job, i.e. this repository at the SHA the caller pinned in `uses:`. See README, "How the scripts are loaded".
+      - name: Guard the scripts ref
+        env:
+          WF_REPO: ${{ job.workflow_repository }}
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$WF_REPO" ] || ! printf '%s' "$WF_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::job.workflow_repository / job.workflow_sha are not populated; cannot load the scripts at the pinned ref."
+            exit 1
+          fi
+          echo "acceptance-spec scripts: $WF_REPO @ $WF_SHA"
+
+      - name: Fetch the acceptance-spec scripts (same pinned ref as this workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .acceptance-spec-src
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Move the scripts out of the workspace
+        env:
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C .acceptance-spec-src rev-parse HEAD)" = "$WF_SHA" ]
+          mv .acceptance-spec-src/scripts "$RUNNER_TEMP/acceptance-scripts"
+          rm -rf .acceptance-spec-src
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: The PR's changed files
+        run: git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed-files.txt"
+
+      - name: A closing PR ships acceptance/<issue>/spec.json
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          ACCEPTANCE_ENFORCE_FROM_ISSUE: ${{ inputs.enforce-from-issue }}
+          ACCEPTANCE_MODE: ${{ inputs.mode }}
+        run: node "$RUNNER_TEMP/acceptance-scripts/acceptance-check.mjs" --changed-files "$RUNNER_TEMP/changed-files.txt"

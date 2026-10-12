@@ -1,0 +1,49 @@
+{
+  "issue": 1,
+  "title": "the widgets endpoint lists a sprocket",
+  "kind": "api",
+  "criteria": [
+    {
+      "id": "C1",
+      "given": "any caller",
+      "then": "GET /api/widgets answers 200 with a list that names a sprocket"
+    },
+    {
+      "id": "C2",
+      "given": "any caller",
+      "then": "GET /api/healthz answers 200"
+    }
+  ],
+  "steps": [
+    {
+      "name": "widgets are listed",
+      "criterion": "C1",
+      "request": {
+        "method": "GET",
+        "path": "/widgets"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "$": {
+            "type": "array"
+          },
+          "[0].name": {
+            "equals": "sprocket"
+          }
+        }
+      }
+    },
+    {
+      "name": "health is ok",
+      "criterion": "C2",
+      "request": {
+        "method": "GET",
+        "path": "/healthz"
+      },
+      "expect": {
+        "status": 200
+      }
+    }
+  ]
+}

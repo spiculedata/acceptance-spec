@@ -1,0 +1,259 @@
+name: run acceptance specs
+
+# Reusable workflow (on: workflow_call). Runs every acceptance/<issue>/spec.json of the CALLER's
+# repository against the caller's OWN build of the PR head.
+#
+#   build-command   builds the app under test (optional)
+#   start-command   starts it in the background (optional; without it, base-url is used as is)
+#   ready-url       polled until it answers 2xx (default base-url)
+#   base-url        the origin api specs may talk to
+#
+# `command` specs always run. `api` specs run only when a base URL is available, otherwise they are
+# recorded `not-run` and never `pass`.
+#
+# Call it from a `pull_request` workflow ONLY, pinned to a full commit SHA:
+#   uses: spiculedata/acceptance-spec/.github/workflows/run-specs.yml@<40-char-sha>
+#
+# Trust model: contents: read, no write scope. The specs are authored in the PR under test and the
+# runner executes them, so spec commands get an allow-listed environment (not the runner's), and api
+# specs may only address the base URL's origin. Secrets come in through the three named workflow
+# secrets only; GitHub withholds them from fork PRs, which then run only what needs none.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory (relative to the repo root) that holds acceptance/ and is the cwd of build and start."
+        type: string
+        default: "."
+      build-command:
+        description: "Shell command that builds the app under test. Empty: no build."
+        type: string
+        default: ""
+      start-command:
+        description: "Shell command that starts the app and keeps running. Empty: nothing is started."
+        type: string
+        default: ""
+      base-url:
+        description: "Origin of the server under test, e.g. http://127.0.0.1:8080. Empty: api specs are not-run."
+        type: string
+        default: ""
+      ready-url:
+        description: "URL polled until it answers 2xx after start-command. Default: base-url."
+        type: string
+        default: ""
+      ready-timeout:
+        description: "Seconds to wait for ready-url."
+        type: number
+        default: 300
+      base-path:
+        description: "Default prefix for relative api step paths (ACCEPTANCE_BASE_PATH), e.g. /api/v1."
+        type: string
+        default: ""
+      session-path:
+        description: "Path of the form login used by auth session specs (ACCEPTANCE_SESSION_PATH), e.g. /session."
+        type: string
+        default: ""
+      skip-without-build-token:
+        description: "When true and the BUILD_TOKEN secret is empty (fork PRs), skip build and start; api specs are not-run."
+        type: boolean
+        default: false
+      mode:
+        description: "enforce (a failing spec fails the job) or report (it is only a warning)."
+        type: string
+        default: enforce
+      node-version:
+        type: string
+        default: "22"
+      java-version:
+        description: "Optional Temurin JDK to install before build-command."
+        type: string
+        default: ""
+      java-cache:
+        description: "setup-java cache: maven, gradle or empty."
+        type: string
+        default: ""
+      runs-on:
+        type: string
+        default: ubuntu-latest
+      timeout-minutes:
+        type: number
+        default: 25
+      artifact-name:
+        description: "Name of the uploaded results artifact."
+        type: string
+        default: acceptance-results
+    secrets:
+      ACCEPTANCE_USER:
+        description: "Account for auth session / basic specs. Use a low-privilege account on a disposable instance."
+        required: false
+      ACCEPTANCE_PASSWORD:
+        required: false
+      BUILD_TOKEN:
+        description: "Exposed to build-command as $BUILD_TOKEN (for example a private package registry token)."
+        required: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  specs:
+    name: acceptance specs
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - name: Only for pull_request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "::error::acceptance-spec workflows must be called from a pull_request workflow (got $EVENT_NAME). Use the plain pull_request trigger."
+            exit 1
+          fi
+          case "$MODE" in enforce|report) ;; *) echo "::error::mode must be enforce or report, got '$MODE'"; exit 1 ;; esac
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # job.workflow_repository / job.workflow_sha identify the REUSABLE workflow file that defines
+      # this job, i.e. this repository at the SHA the caller pinned in `uses:`. See README, "How the scripts are loaded".
+      - name: Guard the scripts ref
+        env:
+          WF_REPO: ${{ job.workflow_repository }}
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$WF_REPO" ] || ! printf '%s' "$WF_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::job.workflow_repository / job.workflow_sha are not populated; cannot load the scripts at the pinned ref."
+            exit 1
+          fi
+          echo "acceptance-spec scripts: $WF_REPO @ $WF_SHA"
+
+      - name: Fetch the acceptance-spec scripts (same pinned ref as this workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .acceptance-spec-src
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Move the scripts out of the workspace
+        env:
+          WF_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C .acceptance-spec-src rev-parse HEAD)" = "$WF_SHA" ]
+          mv .acceptance-spec-src/scripts "$RUNNER_TEMP/acceptance-scripts"
+          rm -rf .acceptance-spec-src
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Set up Java
+        if: inputs.java-version != ''
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: ${{ inputs.java-cache }}
+
+      # Fork PRs get an empty BUILD_TOKEN. With skip-without-build-token the app is neither built nor
+      # started and the base URL is dropped, so api specs are recorded not-run (never pass).
+      - name: Decide whether the app can be built
+        id: decide
+        env:
+          BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
+          SKIP_WITHOUT_TOKEN: ${{ inputs.skip-without-build-token }}
+          START_COMMAND: ${{ inputs.start-command }}
+          INPUT_BASE_URL: ${{ inputs.base-url }}
+        run: |
+          skip=false
+          base_url="$INPUT_BASE_URL"
+          if [ "$SKIP_WITHOUT_TOKEN" = "true" ] && [ -z "${BUILD_TOKEN:-}" ]; then
+            skip=true
+            echo "::warning::BUILD_TOKEN is not available (fork PR): the app cannot be built, so api specs are recorded not-run."
+            if [ -n "$START_COMMAND" ]; then base_url=""; fi
+          fi
+          { echo "skip=$skip"; echo "base_url=$base_url"; } >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        if: inputs.build-command != '' && steps.decide.outputs.skip != 'true'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+          BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
+        run: bash -eo pipefail -c "$BUILD_COMMAND"
+
+      - name: Start the app
+        if: inputs.start-command != '' && steps.decide.outputs.skip != 'true'
+        env:
+          START_COMMAND: ${{ inputs.start-command }}
+          READY_URL: ${{ inputs.ready-url || inputs.base-url }}
+          READY_TIMEOUT: ${{ inputs.ready-timeout }}
+          WORKDIR: ${{ inputs.working-directory }}
+        run: bash "$RUNNER_TEMP/acceptance-scripts/start-server.sh"
+
+      - name: Run the specs
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ACCEPTANCE_USER: ${{ secrets.ACCEPTANCE_USER }}
+          ACCEPTANCE_PASSWORD: ${{ secrets.ACCEPTANCE_PASSWORD }}
+          ACCEPTANCE_BASE_PATH: ${{ inputs.base-path }}
+          ACCEPTANCE_SESSION_PATH: ${{ inputs.session-path }}
+          ACCEPTANCE_BASE_URL: ${{ steps.decide.outputs.base_url }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ -z "$ACCEPTANCE_BASE_URL" ]; then
+            echo "::notice::No server to run against; api specs are recorded as not-run."
+          fi
+          rc=0
+          node "$RUNNER_TEMP/acceptance-scripts/acceptance-runner.mjs" run --all \
+            --out "$RUNNER_TEMP/acceptance-results.json" || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$MODE" = "report" ]; then
+            echo "::warning::report-only: acceptance specs did not pass (exit $rc); not failing the job."
+            exit 0
+          fi
+          exit "$rc"
+
+      # The server dies with the runner anyway; stop it explicitly so its log is complete.
+      - name: Stop the app
+        if: always()
+        run: bash "$RUNNER_TEMP/acceptance-scripts/stop-server.sh"
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo '## Acceptance specs'
+            echo
+            echo '```json'
+            cat "$RUNNER_TEMP/acceptance-results.json" 2>/dev/null || echo '{}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/acceptance-results.json
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+
+      - name: Upload the server log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-name }}-server-log-${{ github.run_id }}
+          path: ${{ runner.temp }}/acceptance-server.log
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
