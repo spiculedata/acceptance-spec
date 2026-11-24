@@ -11,6 +11,7 @@ to the contract, so a later change that regresses it runs the same file. The dir
   "kind": "api",           // "api" | "command" ("ui" is an alias of "command")
   "auth": "session",       // optional, api only: "none" (default) | "session" | "basic"
   "basePath": "/api",      // optional; default is ACCEPTANCE_BASE_PATH (the base-path input), else none
+  "mutatesServer": true,   // optional; run after every other spec (see below)
   "criteria": [ { "id": "C1", "given": "...", "then": "..." } ],
   "steps": [ /* kind api */ ],
   "command": [ /* kind command: argv */ ]
@@ -19,6 +20,11 @@ to the contract, so a later change that regresses it runs the same file. The dir
 
 `criteria` is non-empty: one entry per acceptance criterion in the issue, with a unique `id` and a `then`.
 Derive the criteria from the issue text; if the issue is vague, fix the issue, not the spec.
+
+Specs run in issue order against one shared server. A spec whose proof leaves that server in a state other
+specs must not see, and cannot undo (for example it demotes the only login account and then needs that
+account's admin rights to restore it), sets `"mutatesServer": true`. The runner runs such specs after all the
+others, in issue order among themselves, and lists them in that order in the results.
 
 ## `kind: "api"`
 

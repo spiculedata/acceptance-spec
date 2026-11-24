@@ -405,6 +405,29 @@ test('a command spec runs without a base URL; an api spec does not', async () =>
   assert.equal(results.verdict, 'pass', 'one spec ran green and one could not run at all');
 });
 
+test('a spec that mutates the shared server runs after every other spec', async () => {
+  const log = join(mkdtempSync(join(tmpdir(), 'acc-order-')), 'order.log');
+  const marker = (issue, extra = {}) => ({
+    issue,
+    title: `records ${issue}`,
+    kind: 'command',
+    criteria: [{ id: 'C1', then: 'it ran' }],
+    command: ['node', '-e', `require('fs').appendFileSync(process.env.ACCEPTANCE_ORDER_LOG, '${issue},')`],
+    ...extra
+  });
+  const root = repo({ 3: marker(3), 5: marker(5, { mutatesServer: true }), 7: marker(7), 9: marker(9) });
+  const results = await runSpecs({ repoRoot: root, env: { PATH: process.env.PATH, ACCEPTANCE_ORDER_LOG: log } });
+  assert.equal(readFileSync(log, 'utf8'), '3,7,9,5,', 'the mutating spec ran last; the rest kept issue order');
+  assert.deepEqual(results.specs.map((s) => s.issue), [3, 7, 9, 5], 'results list specs in the order they ran');
+  assert.equal(results.verdict, 'pass');
+});
+
+test('mutatesServer must be a boolean', () => {
+  const spec = { issue: 1, title: 't', kind: 'command', criteria: [{ id: 'C1', then: 'x' }], command: ['true'] };
+  assert.deepEqual(validateSpec({ ...spec, mutatesServer: true }), []);
+  assert.deepEqual(validateSpec({ ...spec, mutatesServer: 'yes' }), ['"mutatesServer" must be true or false when present']);
+});
+
 // ---------------------------------------------------------------- the CLI
 
 test('the runner CLI writes results and exits non-zero only on a real failure', async (t) => {

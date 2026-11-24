@@ -320,19 +320,31 @@ export function runCommandSpec(spec, { baseUrl, dir, timeoutSeconds = spec.timeo
 }
 
 /**
+ * Read every wanted spec and order them for execution: issue order, except that a
+ * spec marked `mutatesServer` (it leaves the shared server in a state no other spec
+ * may see, such as a demoted login account) runs after all the others.
+ */
+function runOrder(repoRoot, issues) {
+  const entries = issues.map((issue) => {
+    try {
+      return { issue, ...readSpec(repoRoot, issue) };
+    } catch (readError) {
+      return { issue, readError };
+    }
+  });
+  const mutates = (e) => e.parsed?.mutatesServer === true;
+  return [...entries.filter((e) => !mutates(e)), ...entries.filter(mutates)];
+}
+
+/**
  * Execute specs and return the results document.
  * @param {{repoRoot: string, baseUrl?: string, basePath?: string, issues?: number[], env?: object}} args
  */
 export async function runSpecs({ repoRoot, baseUrl, issues, env = process.env, basePath = env.ACCEPTANCE_BASE_PATH ?? DEFAULT_BASE_PATH }) {
-  const wanted = issues ?? specIssues(repoRoot);
   const specs = [];
-  for (const issue of wanted) {
-    let parsed;
-    let errors;
-    try {
-      ({ parsed, errors } = readSpec(repoRoot, issue));
-    } catch (err) {
-      specs.push({ issue, kind: null, verdict: 'not-run', reason: `unreadable spec: ${err.message}`, checks: [] });
+  for (const { issue, parsed, errors, readError } of runOrder(repoRoot, issues ?? specIssues(repoRoot))) {
+    if (readError) {
+      specs.push({ issue, kind: null, verdict: 'not-run', reason: `unreadable spec: ${readError.message}`, checks: [] });
       continue;
     }
     const base = { issue, kind: parsed.kind, title: parsed.title, checks: [] };
