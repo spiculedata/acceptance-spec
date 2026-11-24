@@ -97,6 +97,9 @@ export function validateSpec(spec) {
   if (spec.basePath !== undefined && !(typeof spec.basePath === 'string' && /^\/[\w./-]*$/.test(spec.basePath) && !spec.basePath.includes('..'))) {
     errors.push('"basePath" must be a path such as "/api/v1"');
   }
+  if (spec.mutatesServer !== undefined && typeof spec.mutatesServer !== 'boolean') {
+    errors.push('"mutatesServer" must be true or false when present');
+  }
   if (spec.kind === 'api') {
     if (!Array.isArray(spec.steps) || spec.steps.length === 0) {
       errors.push('"steps" must be a non-empty array for an api spec');
